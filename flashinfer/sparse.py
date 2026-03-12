@@ -34,6 +34,7 @@ from .utils import (
     determine_attention_backend,
     device_support_pdl,
     is_float8,
+    is_sm100a_supported,
 )
 
 
@@ -301,6 +302,18 @@ class BlockSparseAttentionWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
+        if self._backend == "auto" and is_sm100a_supported(self.device):
+            cutile_compatible = (
+                R >= 64
+                and C >= 64
+                and mask is None
+                and packed_mask is None
+                and pos_encoding_mode == "NONE"
+                and logits_soft_cap <= 0
+            )
+            if cutile_compatible:
+                self._backend = "cutile"
+
         if self._backend == "cutile":
             if mask is not None or packed_mask is not None:
                 raise ValueError(
@@ -345,7 +358,7 @@ class BlockSparseAttentionWrapper:
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
         qo_indptr = qo_indptr_host.to(indptr.device, non_blocking=non_blocking)
-        if indices.max().item() * C > N:
+        if indices.numel() > 0 and indices.max().item() * C > N:
             raise ValueError("indices out of bound")
         last_block_len = torch.full(
             (num_blocks_row,), C, dtype=torch.int32, device=indptr.device
@@ -599,23 +612,20 @@ class BlockSparseAttentionWrapper:
         if self._use_cutile:
             from .cutile import block_sparse_attention
 
-            q_ct = q.permute(1, 0, 2).unsqueeze(0).contiguous()
-            k_ct = k.permute(1, 0, 2).unsqueeze(0).contiguous()
-            v_ct = v.permute(1, 0, 2).unsqueeze(0).contiguous()
-            out_ct = block_sparse_attention(
-                q_ct,
-                k_ct,
-                v_ct,
+            result = block_sparse_attention(
+                q,
+                k,
+                v,
                 self._cutile_indptr,
                 self._cutile_indices,
                 R=self.R,
                 C=self.C,
                 sm_scale=sm_scale,
                 causal=self._causal,
+                layout="NHD",
             )
-            result = (
-                out_ct.squeeze(0).permute(1, 0, 2).contiguous().to(self._o_dtype)
-            )
+            if result.dtype != self._o_dtype:
+                result = result.to(self._o_dtype)
             if out is not None:
                 out.copy_(result)
             else:

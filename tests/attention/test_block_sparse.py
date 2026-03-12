@@ -80,8 +80,8 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
 
 
-@pytest.mark.parametrize("R", [1, 4, 16])
-@pytest.mark.parametrize("C", [1, 4, 16])
+@pytest.mark.parametrize("R", [1, 4, 16, 64, 128])
+@pytest.mark.parametrize("C", [1, 4, 16, 64, 128])
 @pytest.mark.parametrize("M", [64, 128, 256])
 @pytest.mark.parametrize("N", [64, 128, 256])
 @pytest.mark.parametrize("num_qo_heads", [1, 4, 16])
@@ -94,11 +94,13 @@ def test_block_sparse_attention(
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
 
-    set_seed(33)
-    rng = np.random.default_rng()
-
     MB = M // R
     NB = N // C
+    if MB < 1 or NB < 1:
+        pytest.skip("M must be >= R and N must be >= C")
+
+    set_seed(33)
+    rng = np.random.default_rng()
     S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
     indptr = torch.from_numpy(S.indptr).to(0)
     indices = torch.from_numpy(S.indices).to(0)

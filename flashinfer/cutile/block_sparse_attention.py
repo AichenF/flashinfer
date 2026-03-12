@@ -16,15 +16,22 @@ BSR format:
   indptr:  (MB + 1,)  row-block pointers     MB = ceil(M / R)
   indices: (nnz,)     column-block indices    NB = ceil(N / C)
 
-Inputs:
+Inputs (BHMD layout):
   Q: (B, H_q, M, D)    query
   K: (B, H_kv, N, D)   key
   V: (B, H_kv, N, D)   value
+
+Inputs (NHD layout):
+  Q: (M, H_q, D)       query
+  K: (N, H_kv, D)      key
+  V: (N, H_kv, D)      value
+
+Common:
   indptr:  (MB + 1,)    BSR row pointers   (shared across batch/head)
   indices: (nnz,)       BSR column indices
 
 Output:
-  O: (B, H_q, M, D)    attention output
+  O: same layout as Q
 """
 
 import math
@@ -61,16 +68,18 @@ def block_sparse_attn_kernel(
     QUERY_GROUP_SIZE: ConstInt,
     HAS_VARIABLE_BLOCK_SIZES: ConstBool,
     CAUSAL_WITHIN_BLOCK: ConstBool,
+    LAYOUT_NHD: ConstBool,
 ):
     """
     Block-sparse FlashAttention forward using cuTile.
 
-    Grid:  (num_q_blocks, batch_size * H_Q, 1)
+    Grid:  (num_q_blocks, batch_size * H_Q, 1)  for BHMD
+           (num_q_blocks, H_Q, 1)                for NHD
     Each CTA processes one Q-tile of TILE_M rows and iterates only over
     the non-zero KV blocks given by the BSR pattern.
     """
     bid_m = ct.bid(0)      # Q block index
-    bid_bh = ct.bid(1)     # batch * H_Q
+    bid_bh = ct.bid(1)     # batch * H_Q (BHMD) or H_Q (NHD)
     batch_idx = bid_bh // H_Q
     head_idx = bid_bh % H_Q
     off_kv_h = head_idx // QUERY_GROUP_SIZE
@@ -78,11 +87,18 @@ def block_sparse_attn_kernel(
     qk_scale_log2 = qk_scale * INV_LOG_2
 
     # ---- Load Q tile ----
-    q = ct.load(
-        Q,
-        index=(batch_idx, head_idx, bid_m, 0),
-        shape=(1, 1, TILE_M, TILE_D),
-    ).reshape((TILE_M, TILE_D))
+    if LAYOUT_NHD:
+        q = ct.load(
+            Q,
+            index=(bid_m, head_idx, 0),
+            shape=(TILE_M, 1, TILE_D),
+        ).reshape((TILE_M, TILE_D))
+    else:
+        q = ct.load(
+            Q,
+            index=(batch_idx, head_idx, bid_m, 0),
+            shape=(1, 1, TILE_M, TILE_D),
+        ).reshape((TILE_M, TILE_D))
 
     # ---- Online softmax accumulators ----
     m_i = ct.full((TILE_M, 1), -math.inf, dtype=ct.float32)   # running row max
@@ -110,12 +126,20 @@ def block_sparse_attn_kernel(
 
         # ---- Load K tile: (TILE_D, TILE_N) via load + permute ----
         # NOTE: ct.load with order= and dynamic index is broken in cuTile 1.2.0
-        k = ct.load(
-            K,
-            index=(batch_idx, off_kv_h, col_block, 0),
-            shape=(1, 1, TILE_N, TILE_D),
-            latency=2,
-        ).reshape((TILE_N, TILE_D)).permute((1, 0))
+        if LAYOUT_NHD:
+            k = ct.load(
+                K,
+                index=(col_block, off_kv_h, 0),
+                shape=(TILE_N, 1, TILE_D),
+                latency=2,
+            ).reshape((TILE_N, TILE_D)).permute((1, 0))
+        else:
+            k = ct.load(
+                K,
+                index=(batch_idx, off_kv_h, col_block, 0),
+                shape=(1, 1, TILE_N, TILE_D),
+                latency=2,
+            ).reshape((TILE_N, TILE_D)).permute((1, 0))
 
         # ---- QK = Q @ K^T : (TILE_M, TILE_N) ----
         qk = ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
@@ -150,12 +174,20 @@ def block_sparse_attn_kernel(
         acc = acc * alpha
 
         # ---- Load V tile: (TILE_N, TILE_D) ----
-        v = ct.load(
-            V,
-            index=(batch_idx, off_kv_h, col_block, 0),
-            shape=(1, 1, TILE_N, TILE_D),
-            latency=4,
-        ).reshape((TILE_N, TILE_D))
+        if LAYOUT_NHD:
+            v = ct.load(
+                V,
+                index=(col_block, off_kv_h, 0),
+                shape=(TILE_N, 1, TILE_D),
+                latency=4,
+            ).reshape((TILE_N, TILE_D))
+        else:
+            v = ct.load(
+                V,
+                index=(batch_idx, off_kv_h, col_block, 0),
+                shape=(1, 1, TILE_N, TILE_D),
+                latency=4,
+            ).reshape((TILE_N, TILE_D))
 
         # ---- Accumulate P @ V ----
         p = p.astype(Q.dtype)
@@ -164,9 +196,15 @@ def block_sparse_attn_kernel(
         m_i = m_ij
 
     # ---- Final normalization: O = acc / l_i ----
+    # Guard against div-by-zero when a Q block has no KV blocks (l_i stays 0).
+    l_i = ct.where(l_i == 0.0, ct.full((TILE_M, 1), 1.0, dtype=ct.float32), l_i)
     acc = ct.truediv(acc, l_i, flush_to_zero=True, rounding_mode=ct.RoundingMode.APPROX)
-    acc = acc.reshape((1, 1, TILE_M, TILE_D)).astype(Out.dtype)
-    ct.store(Out, index=(batch_idx, head_idx, bid_m, 0), tile=acc)
+    if LAYOUT_NHD:
+        acc = acc.reshape((TILE_M, 1, TILE_D)).astype(Out.dtype)
+        ct.store(Out, index=(bid_m, head_idx, 0), tile=acc)
+    else:
+        acc = acc.reshape((1, 1, TILE_M, TILE_D)).astype(Out.dtype)
+        ct.store(Out, index=(batch_idx, head_idx, bid_m, 0), tile=acc)
 
 
 # ---------------------------------------------------------------------------
@@ -203,14 +241,15 @@ def block_sparse_attention(
     sm_scale: float | None = None,
     causal: bool = False,
     variable_block_sizes: Optional[torch.Tensor] = None,
+    layout: str = "BHMD",
 ) -> torch.Tensor:
     """
     Block-sparse attention using BSR mask format.
 
     Args:
-        q: (B, H_q, M, D)   query tensor
-        k: (B, H_kv, N, D)  key tensor
-        v: (B, H_kv, N, D)  value tensor
+        q: query tensor — (B, H_q, M, D) for BHMD or (M, H_q, D) for NHD
+        k: key tensor   — (B, H_kv, N, D) for BHMD or (N, H_kv, D) for NHD
+        v: value tensor — (B, H_kv, N, D) for BHMD or (N, H_kv, D) for NHD
         indptr:  (MB+1,) int32  BSR row pointers
         indices: (nnz,)  int32  BSR column indices
         R: block row size (must match TILE_M)
@@ -222,9 +261,10 @@ def block_sparse_attention(
             When provided, columns beyond variable_block_sizes[j] in
             KV block j are masked out (set to -inf before softmax).
             This enables non-uniform block widths within a fixed tile grid.
+        layout: tensor layout — "BHMD" (default) or "NHD"
 
     Returns:
-        out: (B, H_q, M, D)  attention output
+        out: same layout as input q
     """
     q = q.contiguous()
     k = k.contiguous()
@@ -232,8 +272,16 @@ def block_sparse_attention(
     indptr = indptr.contiguous().to(torch.int32)
     indices = indices.contiguous().to(torch.int32)
 
-    B, H_q, M, D = q.shape
-    _, H_kv, N, _ = k.shape
+    use_nhd = layout.upper() == "NHD"
+
+    if use_nhd:
+        M, H_q, D = q.shape
+        _, H_kv, _ = k.shape
+        B = 1
+    else:
+        B, H_q, M, D = q.shape
+        _, H_kv, N, _ = k.shape
+
     assert H_q % H_kv == 0
     query_group_size = H_q // H_kv
 
@@ -275,6 +323,7 @@ def block_sparse_attention(
             query_group_size,
             has_var_blocks,      # HAS_VARIABLE_BLOCK_SIZES
             causal,              # CAUSAL_WITHIN_BLOCK
+            use_nhd,             # LAYOUT_NHD
         ),
     )
     return out

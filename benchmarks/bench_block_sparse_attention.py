@@ -67,7 +67,20 @@ def bench_variable_block_sparse_attention(
     sparse_wrapper_fa2 = flashinfer.sparse.VariableBlockSparseAttentionWrapper(
         float_workspace_buffer, backend="fa2"
     )
+    sparse_wrapper_fa3 = flashinfer.sparse.VariableBlockSparseAttentionWrapper(
+        float_workspace_buffer, backend="fa3"
+    )
+
     sparse_wrapper_fa2.plan(
+        block_mask_map=block_mask_map,
+        block_row_sz=block_row_sz,
+        block_col_sz=block_col_sz,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_data_type=torch.half,
+    )
+    sparse_wrapper_fa3.plan(
         block_mask_map=block_mask_map,
         block_row_sz=block_row_sz,
         block_col_sz=block_col_sz,
@@ -85,91 +98,29 @@ def bench_variable_block_sparse_attention(
     )
     sparse_ms_fa2 = np.median(measurements_fa2)
 
-    # Benchmark sparse attention with FA3 (may fail on Blackwell/SM100)
-    sparse_ms_fa3 = float("nan")
-    try:
-        sparse_wrapper_fa3 = flashinfer.sparse.VariableBlockSparseAttentionWrapper(
-            float_workspace_buffer, backend="fa3"
-        )
-        sparse_wrapper_fa3.plan(
-            block_mask_map=block_mask_map,
-            block_row_sz=block_row_sz,
-            block_col_sz=block_col_sz,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            q_data_type=torch.half,
-        )
-        measurements_fa3 = bench_gpu_time(
-            lambda: sparse_wrapper_fa3.run(q, k, v),
-            dry_run_time_ms=100,
-            repeat_time_ms=1000,
-        )
-        sparse_ms_fa3 = np.median(measurements_fa3)
-    except Exception as e:
-        print(f"  [FA3 sparse skipped: {e}]")
-
-    # Benchmark sparse attention with cuTile (Blackwell-native, tile-aligned R=C=128)
-    R_ct, C_ct = 128, 128
-    MB_ct, NB_ct = seq_len // R_ct, seq_len // C_ct
-    sparse_ms_cutile = float("nan")
-    if MB_ct > 0 and NB_ct > 0:
-        try:
-            bm = torch.rand(MB_ct, NB_ct) < block_density
-            for i in range(MB_ct):
-                if not bm[i].any():
-                    bm[i, torch.randint(NB_ct, (1,))] = True
-            indptr_l, indices_l = [0], []
-            for i in range(MB_ct):
-                for j in range(NB_ct):
-                    if bm[i, j]:
-                        indices_l.append(j)
-                indptr_l.append(len(indices_l))
-            indptr_ct = torch.tensor(indptr_l, dtype=torch.int32, device="cuda")
-            indices_ct = torch.tensor(indices_l, dtype=torch.int32, device="cuda")
-            q_ct = torch.randn(seq_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda")
-            k_ct = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
-            v_ct = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
-            ct_wrapper = flashinfer.BlockSparseAttentionWrapper(
-                float_workspace_buffer, backend="cutile"
-            )
-            ct_wrapper.plan(
-                indptr_ct, indices_ct, seq_len, seq_len,
-                R_ct, C_ct, num_qo_heads, num_kv_heads, head_dim,
-                q_data_type=torch.half,
-            )
-            sparse_ms_cutile = np.median(bench_gpu_time(
-                lambda: ct_wrapper.run(q_ct, k_ct, v_ct),
-                dry_run_time_ms=100, repeat_time_ms=1000,
-            ))
-        except Exception as e:
-            print(f"  [cuTile skipped: {e}]")
+    # Benchmark sparse attention with FA3
+    measurements_fa3 = bench_gpu_time(
+        lambda: sparse_wrapper_fa3.run(q, k, v),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
+    )
+    sparse_ms_fa3 = np.median(measurements_fa3)
 
     q = torch.randn(seq_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda")
     k = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
     v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
-    dense_sm80_ms = np.median(
-        bench_gpu_time(
-            lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-                q, k, v, causal=False, backend="fa2"
-            ),
-            dry_run_time_ms=100,
-            repeat_time_ms=1000,
-        )
-    )
-    dense_sm90_ms = float("nan")
-    try:
-        dense_sm90_ms = np.median(
+    dense_sm80_ms, dense_sm90_ms = (
+        np.median(
             bench_gpu_time(
                 lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-                    q, k, v, causal=False, backend="fa3"
+                    q, k, v, causal=False, backend=backend
                 ),
                 dry_run_time_ms=100,
                 repeat_time_ms=1000,
             )
         )
-    except Exception as e:
-        print(f"  [FA3 dense skipped: {e}]")
+        for backend in ["fa2", "fa3"]
+    )
 
     def flops(ms):
         return attention_tflops_per_sec_with_actual_seq_lens(
@@ -183,7 +134,7 @@ def bench_variable_block_sparse_attention(
         )
 
     print(
-        f"bench_variable_block_sparse_attention (num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, seq_len={seq_len}, num_blocks_row={num_blocks_row}, num_blocks_col={num_blocks_col}, block_density={block_density}), sparse cutile(R={R_ct}): {flops(sparse_ms_cutile):.3f} TFLOPs/s, sparse fa2-template: {flops(sparse_ms_fa2):.3f} TFLOPs/s, sparse fa3-template: {flops(sparse_ms_fa3):.3f} TFLOPs/s, dense fa2-template: {flops(dense_sm80_ms):.3f} TFLOPs/s, dense fa3-template: {flops(dense_sm90_ms):.3f} TFLOPs/s"
+        f"bench_variable_block_sparse_attention (num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, seq_len={seq_len}, num_blocks_row={num_blocks_row}, num_blocks_col={num_blocks_col}, block_density={block_density}), sparse fa2-template: {flops(sparse_ms_fa2):.3f} TFLOPs/s, sparse fa3-template: {flops(sparse_ms_fa3):.3f} TFLOPs/s, dense fa2-template: {flops(dense_sm80_ms):.3f} TFLOPs/s, dense fa3-template: {flops(dense_sm90_ms):.3f} TFLOPs/s"
     )
 
 
