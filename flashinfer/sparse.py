@@ -122,9 +122,13 @@ class BlockSparseAttentionWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cutile``.
+            Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
+            If set to ``cutile``, uses the cuTile (cuda.tile) Blackwell-native kernel.
+            The cuTile backend requires R, C >= 64 and does not support per-element
+            mask, RoPE, logits_soft_cap, or FP8 quantization.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -157,6 +161,7 @@ class BlockSparseAttentionWrapper:
         self.M: Optional[int] = None
         self.N: Optional[int] = None
         self._backend = backend
+        self._use_cutile = False
 
     def reset_workspace_buffer(
         self,
@@ -295,6 +300,46 @@ class BlockSparseAttentionWrapper:
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+
+        if self._backend == "cutile":
+            if mask is not None or packed_mask is not None:
+                raise ValueError(
+                    "cuTile backend does not support per-element mask"
+                )
+            if pos_encoding_mode != "NONE":
+                raise ValueError(
+                    "cuTile backend only supports pos_encoding_mode='NONE'"
+                )
+            if logits_soft_cap > 0:
+                raise ValueError(
+                    "cuTile backend does not support logits_soft_cap"
+                )
+            self._use_cutile = True
+            self._cutile_indptr = (
+                indptr.to(self.device, non_blocking=non_blocking)
+                .contiguous()
+                .to(torch.int32)
+            )
+            self._cutile_indices = (
+                indices.to(self.device, non_blocking=non_blocking)
+                .contiguous()
+                .to(torch.int32)
+            )
+            self.M = M
+            self.N = N
+            self.R = R
+            self.C = C
+            self._causal = causal
+            self._pos_encoding_mode = pos_encoding_mode
+            self._use_fp16_qk_reduction = use_fp16_qk_reduction
+            self._logits_soft_cap = logits_soft_cap
+            self._sm_scale = (
+                sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
+            )
+            self._rope_scale = rope_scale
+            self._rope_theta = rope_theta
+            self._o_dtype = canonicalize_torch_dtype(o_data_type)
+            return
 
         num_blocks_row = len(indptr) - 1
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
@@ -550,6 +595,37 @@ class BlockSparseAttentionWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+
+        if self._use_cutile:
+            from .cutile import block_sparse_attention
+
+            q_ct = q.permute(1, 0, 2).unsqueeze(0).contiguous()
+            k_ct = k.permute(1, 0, 2).unsqueeze(0).contiguous()
+            v_ct = v.permute(1, 0, 2).unsqueeze(0).contiguous()
+            out_ct = block_sparse_attention(
+                q_ct,
+                k_ct,
+                v_ct,
+                self._cutile_indptr,
+                self._cutile_indices,
+                R=self.R,
+                C=self.C,
+                sm_scale=sm_scale,
+                causal=self._causal,
+            )
+            result = (
+                out_ct.squeeze(0).permute(1, 0, 2).contiguous().to(self._o_dtype)
+            )
+            if out is not None:
+                out.copy_(result)
+            else:
+                out = result
+            if return_lse:
+                raise NotImplementedError(
+                    "cuTile backend does not support return_lse"
+                )
+            return out
+
         k = k.reshape(-1, self.C, *k.shape[-2:])
         v = v.reshape(-1, self.C, *v.shape[-2:])
 
