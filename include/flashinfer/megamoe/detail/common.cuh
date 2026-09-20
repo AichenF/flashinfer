@@ -22,10 +22,21 @@
 #endif
 
 // ============ exception.cuh ============
+// Assertions live in CUTLASS_HOST_DEVICE helpers (workspace sizing is shared by
+// the launcher and the kernel), so the failure path must also be legal in a host
+// pass -- a "trap;" inline asm is not.
+#ifndef FI_MEGAMOE_TRAP
+#if defined(__CUDA_ARCH__)
+#define FI_MEGAMOE_TRAP() asm("trap;")
+#else
+#define FI_MEGAMOE_TRAP() __builtin_trap()
+#endif
+#endif
+
 #ifdef __CLION_IDE__
 
 CUTLASS_HOST_DEVICE void host_device_printf(const char* format, ...) {
-    asm volatile("trap;");
+    FI_MEGAMOE_TRAP();
 }
 
 #define printf host_device_printf
@@ -36,7 +47,7 @@ CUTLASS_HOST_DEVICE void host_device_printf(const char* format, ...) {
 do { \
     if (not (cond)) { \
         printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
-        asm("trap;"); \
+        FI_MEGAMOE_TRAP(); \
     } \
 } while (0)
 #endif
@@ -45,7 +56,7 @@ do { \
 #define FI_MEGAMOE_TRAP_ONLY_DEVICE_ASSERT(cond) \
 do { \
     if (not (cond)) \
-        asm("trap;"); \
+        FI_MEGAMOE_TRAP(); \
 } while (0)
 #endif
 
