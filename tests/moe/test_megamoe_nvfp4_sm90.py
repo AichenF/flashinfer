@@ -101,7 +101,7 @@ def worker(local_rank, world_size, args):
                 activation="swiglu",
                 activation_clamp=10.0,
                 fast_math=True,
-                kernel_family="fused",
+                kernel_family="auto",
                 family_threshold=256,
             )
             torch.cuda.synchronize()

@@ -13,15 +13,34 @@ Usage::
     nvfp4_mega_moe(y, l1_weights, l2_weights, buf)
 """
 
+import dataclasses
 import functools
 from typing import Optional, Tuple
 
 import torch
 
-from ..jit.megamoe import gen_megamoe_sm90_nvfp4_module
-from .heuristics import FusedPlan, select_fused_plan
+from ..jit.megamoe import (
+    gen_megamoe_sm90_nvfp4_module,
+    gen_megamoe_sm90_nvfp4_split_module,
+    gen_megamoe_sm90_nvfp4_split_plan_module,
+)
+from .heuristics import (
+    CANDIDATE_BLOCK_M,
+    FusedPlan,
+    get_num_max_pool_tokens,
+    get_num_padded_sf_pool_tokens,
+    select_fused_plan,
+)
 
-__all__ = ["MegaMoESymmBuffer", "nvfp4_mega_moe", "select_fused_plan", "FusedPlan"]
+__all__ = [
+    "MegaMoESymmBuffer",
+    "nvfp4_mega_moe",
+    "select_fused_plan",
+    "FusedPlan",
+    "SplitPlan",
+    "select_split_plan",
+    "FAMILY_THRESHOLD",
+]
 
 
 @functools.cache
@@ -171,6 +190,8 @@ def nvfp4_mega_moe(
     l2_global_scales: Optional[torch.Tensor] = None,
     force_push_dispatch: Optional[bool] = None,
     force_no_clean_barrier: Optional[bool] = None,
+    kernel_family: str = "auto",
+    family_threshold: int = 256,
 ) -> torch.Tensor:
     """Run one fused NVFP4 MegaMoE step.
 
@@ -185,6 +206,24 @@ def nvfp4_mega_moe(
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
+
+    if kernel_family == "auto":
+        kernel_family = "fused" if m <= family_threshold else "split"
+    if kernel_family not in ("fused", "split"):
+        raise ValueError(
+            f"kernel_family must be 'auto', 'fused' or 'split', got {kernel_family!r}"
+        )
+    if kernel_family == "split":
+        return _run_split(
+            y,
+            l1_weights,
+            l2_weights,
+            b,
+            m,
+            cumulative_local_expert_recv_stats,
+            l1_global_scales,
+            l2_global_scales,
+        )
 
     plan = select_fused_plan(
         b.num_sms,
@@ -221,5 +260,175 @@ def nvfp4_mega_moe(
         cumulative_local_expert_recv_stats,
         l1_global_scales,
         l2_global_scales,
+    )
+    return y
+
+
+# ---------------------------------------------------------------------------
+# Split (BN128) family -- selected above the fused threshold
+# ---------------------------------------------------------------------------
+
+#: Above this many tokens per rank a single fused persistent kernel no longer
+#: fits the working set and the two-kernel split family takes over.
+FAMILY_THRESHOLD = 256
+
+
+@dataclasses.dataclass(frozen=True)
+class SplitPlan:
+    l1_num_stages: int
+    l1_smem_size: int
+    l2_num_stages: int
+    l2_smem_size: int
+    num_experts_per_wave: int
+    num_max_pool_tokens: int
+    dispatch_dequant: bool
+    l2_arrival_counter: bool
+    num_padded_sf_pool_tokens: int
+
+
+@functools.cache
+def _get_split_plan_module(
+    num_sms,
+    num_ranks,
+    num_max_tokens_per_rank,
+    num_experts,
+    num_topk,
+    hidden,
+    intermediate_hidden,
+):
+    return gen_megamoe_sm90_nvfp4_split_plan_module(
+        num_sms,
+        num_ranks,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+    ).build_and_load()
+
+
+@functools.cache
+def select_split_plan(
+    num_sms,
+    num_ranks,
+    num_experts,
+    num_topk,
+    hidden,
+    intermediate_hidden,
+    num_max_tokens_per_rank,
+    num_tokens,
+) -> SplitPlan:
+    """Ask the plan module for the L1/L2 pipeline configuration.
+
+    The sizing arithmetic mirrors the kernel's shared-memory layout exactly, so
+    it is evaluated by the same C++ code the kernel is built from rather than
+    being re-derived here.
+    """
+    sf_pool = max(
+        get_num_padded_sf_pool_tokens(
+            get_num_max_pool_tokens(
+                num_ranks, num_max_tokens_per_rank, num_topk, num_experts // num_ranks
+            ),
+            bm,
+        )
+        for bm in CANDIDATE_BLOCK_M
+    )
+    mod = _get_split_plan_module(
+        num_sms,
+        num_ranks,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+    )
+    v = list(
+        mod.megamoe_sm90_nvfp4_split_plan(
+            num_sms,
+            num_ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_tokens,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            sf_pool,
+        )
+    )
+    return SplitPlan(
+        l1_num_stages=v[0],
+        l1_smem_size=v[1],
+        l2_num_stages=v[2],
+        l2_smem_size=v[3],
+        num_experts_per_wave=v[4],
+        num_max_pool_tokens=v[5],
+        dispatch_dequant=bool(v[6]),
+        l2_arrival_counter=bool(v[7]),
+        num_padded_sf_pool_tokens=sf_pool,
+    )
+
+
+@functools.cache
+def _get_split_module(
+    plan,
+    num_sms,
+    num_ranks,
+    num_max_tokens_per_rank,
+    num_experts,
+    num_topk,
+    hidden,
+    intermediate_hidden,
+    activation_clamp,
+    fast_math,
+):
+    return gen_megamoe_sm90_nvfp4_split_module(
+        plan,
+        num_sms,
+        num_ranks,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        activation_clamp,
+        fast_math,
+    ).build_and_load()
+
+
+def _run_split(y, l1_weights, l2_weights, b, m, stats, gs1, gs2):
+    plan = select_split_plan(
+        b.num_sms,
+        b.group.size(),
+        b.num_experts,
+        b.num_topk,
+        b.hidden,
+        b.intermediate_hidden,
+        b.num_max_tokens_per_rank,
+        m,
+    )
+    mod = _get_split_module(
+        plan,
+        b.num_sms,
+        b.group.size(),
+        b.num_max_tokens_per_rank,
+        b.num_experts,
+        b.num_topk,
+        b.hidden,
+        b.intermediate_hidden,
+        b.activation_clamp,
+        b.fast_math,
+    )
+    mod.megamoe_sm90_nvfp4_split(
+        y,
+        b.buffer,
+        b.handle.buffer_ptrs,
+        b.group.rank(),
+        l1_weights,
+        l2_weights,
+        b._offsets,
+        m,
+        stats,
+        gs1,
+        gs2,
     )
     return y
