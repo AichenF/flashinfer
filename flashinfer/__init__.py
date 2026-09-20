@@ -431,3 +431,4 @@ from .kda_prefill import KDAPrefillPlanCache as KDAPrefillPlanCache
 from .kda_prefill import (
     kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
 )
+from . import megamoe as megamoe
