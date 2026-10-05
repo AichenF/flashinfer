@@ -34,7 +34,11 @@ def worker(local_rank, world_size, args):
     from deep_gemm.utils import per_token_cast_to_fp8
     from deep_gemm.utils.dist import init_dist
 
-    from flashinfer.megamoe import MegaMoESymmBuffer, nvfp4_mega_moe
+    from flashinfer.megamoe import (
+        FAMILY_THRESHOLD,
+        MegaMoESymmBuffer,
+        nvfp4_mega_moe,
+    )
 
     rank, num_ranks, group = init_dist(local_rank, world_size)
     failures = 0
@@ -67,11 +71,13 @@ def worker(local_rank, world_size, args):
         )
         l1_packed, l1_scale = quantize_to_nvfp4(l1_bf, group_size=16)
         l2_packed, l2_scale = quantize_to_nvfp4(l2_bf, group_size=16)
-        l1w, l2w = deep_gemm.transform_nvfp4_weights_for_mega_moe_sm90(
-            (l1_packed, l1_scale), (l2_packed, l2_scale), block_n=256
-        )
-        del l1_bf, l2_bf, l1_packed, l2_packed
+        del l1_bf, l2_bf
         torch.cuda.empty_cache()
+
+        # The prepacked scales are tile-major (E, N/block_n, K/128, block_n, 8),
+        # so the weight layout is part of the family: block_n=256 for the fused
+        # kernel, block_n=128 for split L1/L2. Build each on first use.
+        transformed = {}
 
         ref_buf = deep_gemm.get_symm_buffer_for_mega_moe(
             group, num_experts, args.cap, num_topk, hidden, ih
@@ -89,6 +95,19 @@ def worker(local_rank, world_size, args):
             )
             topk_idx, topk_w = make_routing(m, num_experts, num_topk, rank, 0)
 
+            # Pin the family on both sides rather than letting each one's
+            # own "auto" rule decide -- a silent disagreement would compare
+            # two different kernels and still look like a pass.
+            family = "split" if m > FAMILY_THRESHOLD else "fused"
+            block_n = 128 if family == "split" else 256
+            if block_n not in transformed:
+                transformed[block_n] = (
+                    deep_gemm.transform_nvfp4_weights_for_mega_moe_sm90(
+                        (l1_packed, l1_scale), (l2_packed, l2_scale), block_n=block_n
+                    )
+                )
+            l1w, l2w = transformed[block_n]
+
             y_ref = torch.zeros((m, hidden), dtype=torch.bfloat16, device="cuda")
             ref_buf.x[:m].copy_(x_fp8)
             ref_buf.x_sf[:m].copy_(x_sf)
@@ -103,15 +122,22 @@ def worker(local_rank, world_size, args):
                 activation="swiglu",
                 activation_clamp=10.0,
                 fast_math=args.fast_math,
-                kernel_family="auto",
-                family_threshold=256,
+                kernel_family=family,
+                family_threshold=FAMILY_THRESHOLD,
             )
             torch.cuda.synchronize()
             dist.barrier(group=group)
 
             y_fi = torch.zeros((m, hidden), dtype=torch.bfloat16, device="cuda")
             fi_buf.stage(x_fp8, x_sf, topk_idx, topk_w)
-            nvfp4_mega_moe(y_fi, l1w[0], l2w[0], fi_buf)
+            nvfp4_mega_moe(
+                y_fi,
+                l1w[0],
+                l2w[0],
+                fi_buf,
+                kernel_family=family,
+                family_threshold=FAMILY_THRESHOLD,
+            )
             torch.cuda.synchronize()
             dist.barrier(group=group)
 
@@ -141,7 +167,7 @@ def worker(local_rank, world_size, args):
                     else f" max_abs={max_abs.item():.3e} n={int(num_diff.item())}"
                 )
                 print(
-                    f"{tag} {shape_name} M={m} fm={args.fast_math} "
+                    f"{tag} {shape_name} M={m} {family} fm={args.fast_math} "
                     f"bit-identical={same} finite={finite}{extra}",
                     flush=True,
                 )
@@ -149,7 +175,7 @@ def worker(local_rank, world_size, args):
 
         ref_buf.destroy()
         fi_buf.destroy()
-        del l1w, l2w
+        del transformed, l1_packed, l2_packed, l1_scale, l2_scale
         torch.cuda.empty_cache()
 
     dist.barrier(group=group)
