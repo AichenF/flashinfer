@@ -76,7 +76,9 @@ def worker(local_rank, world_size, args):
         ref_buf = deep_gemm.get_symm_buffer_for_mega_moe(
             group, num_experts, args.cap, num_topk, hidden, ih
         )
-        fi_buf = MegaMoESymmBuffer(group, num_experts, args.cap, num_topk, hidden, ih)
+        fi_buf = MegaMoESymmBuffer(
+            group, num_experts, args.cap, num_topk, hidden, ih, fast_math=args.fast_math
+        )
 
         for m in args.m:
             x_bf = torch.randn(
@@ -100,7 +102,7 @@ def worker(local_rank, world_size, args):
                 recipe=(128, 128, 128),
                 activation="swiglu",
                 activation_clamp=10.0,
-                fast_math=True,
+                fast_math=args.fast_math,
                 kernel_family="auto",
                 family_threshold=256,
             )
@@ -139,7 +141,8 @@ def worker(local_rank, world_size, args):
                     else f" max_abs={max_abs.item():.3e} n={int(num_diff.item())}"
                 )
                 print(
-                    f"{tag} {shape_name} M={m} bit-identical={same} finite={finite}{extra}",
+                    f"{tag} {shape_name} M={m} fm={args.fast_math} "
+                    f"bit-identical={same} finite={finite}{extra}",
                     flush=True,
                 )
             failures += 0 if ok else 1
@@ -163,6 +166,12 @@ def main():
     p.add_argument("--m", nargs="+", type=int, default=[1, 2, 8, 16, 32, 64])
     p.add_argument("--cap", type=int, default=8448)
     p.add_argument("--num-processes", type=int, default=8)
+    # kFastMath is a template parameter of the kernel, so it must match on both
+    # sides. The False path additionally needs the JIT spec to override the
+    # -use_fast_math that gen_jit_spec() applies to every module.
+    p.add_argument(
+        "--no-fast-math", dest="fast_math", action="store_false", default=True
+    )
     args = p.parse_args()
     torch.multiprocessing.spawn(
         worker, args=(args.num_processes, args), nprocs=args.num_processes
