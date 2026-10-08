@@ -187,11 +187,12 @@ def gen_megamoe_sm90_nvfp4_split_plan_module(
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
     dest = gen_directory / "megamoe_sm90_nvfp4_split_plan.cu"
-    write_if_different(dest, open(csrc / "megamoe_sm90_nvfp4_split_plan.cu").read())
-    write_if_different(
-        gen_directory / "megamoe_sm90_nvfp4_split_plan.cuh",
-        open(csrc / "megamoe_sm90_nvfp4_split_plan.cuh").read(),
-    )
+    for filename in (
+        "megamoe_sm90_nvfp4_split_plan.cu",
+        "megamoe_sm90_nvfp4_split_plan.cuh",
+    ):
+        with open(csrc / filename) as f:
+            write_if_different(gen_directory / filename, f.read())
     return gen_jit_spec(
         uri,
         [dest],
@@ -292,7 +293,8 @@ def gen_megamoe_sm90_nvfp4_split_module(
         "megamoe_sm90_nvfp4_split_binding.cu",
     ):
         dest = gen_directory / filename
-        write_if_different(dest, open(csrc / filename).read())
+        with open(csrc / filename) as f:
+            write_if_different(dest, f.read())
         source_paths.append(dest)
 
     return gen_jit_spec(
