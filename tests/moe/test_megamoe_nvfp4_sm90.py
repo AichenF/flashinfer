@@ -82,17 +82,23 @@ def worker(local_rank, world_size, args):
             nvfp4_mega_moe(y_fi, l1w[0], l2w[0], fi_buf)
             torch.cuda.synchronize(); dist.barrier(group=group)
 
-            same = torch.equal(y_fi.view(torch.int16), y_ref.view(torch.int16))
-            finite = bool(torch.isfinite(y_fi.float()).all().item())
-            ok = torch.tensor([1 if (same and finite) else 0], device="cuda", dtype=torch.int32)
-            dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
-            ok = bool(ok.item())
+            # Reduce every reported field across ranks, so the line rank 0
+            # prints describes all of them rather than its own slice.
+            d = (y_fi.float() - y_ref.float()).abs()
+            flags = torch.tensor(
+                [int(torch.equal(y_fi.view(torch.int16), y_ref.view(torch.int16))),
+                 int(torch.isfinite(y_fi.float()).all().item())],
+                device="cuda", dtype=torch.int32)
+            max_abs = d.max().reshape(1)
+            num_diff = (d > 0).sum().reshape(1)
+            dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=group)
+            dist.all_reduce(max_abs, op=dist.ReduceOp.MAX, group=group)
+            dist.all_reduce(num_diff, op=dist.ReduceOp.SUM, group=group)
+            same, finite = bool(flags[0].item()), bool(flags[1].item())
+            ok = same and finite
             if rank == 0:
                 tag = "PASS" if ok else "FAIL"
-                extra = ""
-                if not same:
-                    d = (y_fi.float() - y_ref.float()).abs()
-                    extra = f" max_abs={d.max().item():.3e} n={int((d > 0).sum().item())}"
+                extra = "" if same else f" max_abs={max_abs.item():.3e} n={int(num_diff.item())}"
                 print(f"{tag} {shape_name} M={m} bit-identical={same} finite={finite}{extra}",
                       flush=True)
             failures += 0 if ok else 1
