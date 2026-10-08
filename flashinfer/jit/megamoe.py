@@ -22,13 +22,22 @@ def _csrc_dir() -> Path:
     checkout = Path(__file__).resolve().parents[2] / "csrc" / "megamoe"
     if checkout.exists():
         return checkout
-    raise FileNotFoundError(f"MegaMoE CUDA sources not found (checked {installed}, {checkout})")
+    raise FileNotFoundError(
+        f"MegaMoE CUDA sources not found (checked {installed}, {checkout})"
+    )
 
 
-def get_megamoe_sm90_nvfp4_uri(plan, num_sms: int, num_max_tokens_per_rank: int,
-                               num_experts: int, num_topk: int, hidden: int,
-                               intermediate_hidden: int, activation_clamp: float,
-                               fast_math: bool) -> str:
+def get_megamoe_sm90_nvfp4_uri(
+    plan,
+    num_sms: int,
+    num_max_tokens_per_rank: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+    activation_clamp: float,
+    fast_math: bool,
+) -> str:
     return (
         f"megamoe_sm90_nvfp4_sm{num_sms}_e{num_experts}_k{num_topk}"
         f"_h{hidden}_i{intermediate_hidden}_cap{num_max_tokens_per_rank}"
@@ -58,8 +67,15 @@ def gen_megamoe_sm90_nvfp4_module(
     fast_math: bool,
 ) -> JitSpec:
     uri = get_megamoe_sm90_nvfp4_uri(
-        plan, num_sms, num_max_tokens_per_rank, num_experts, num_topk, hidden,
-        intermediate_hidden, activation_clamp, fast_math,
+        plan,
+        num_sms,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        activation_clamp,
+        fast_math,
     )
     csrc = _csrc_dir()
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -99,7 +115,8 @@ def gen_megamoe_sm90_nvfp4_module(
     source_paths = []
     for filename in ("megamoe_sm90_nvfp4_fused.cu", "megamoe_sm90_nvfp4_binding.cu"):
         dest = gen_directory / filename
-        write_if_different(dest, open(csrc / filename).read())
+        with open(csrc / filename) as f:
+            write_if_different(dest, f.read())
         source_paths.append(dest)
 
     return gen_jit_spec(

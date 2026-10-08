@@ -88,7 +88,10 @@ def align(x: int, a: int) -> int:
 
 
 def get_num_max_pool_tokens(
-    num_ranks: int, num_max_tokens_per_rank: int, num_topk: int, num_experts_per_rank: int
+    num_ranks: int,
+    num_max_tokens_per_rank: int,
+    num_topk: int,
+    num_experts_per_rank: int,
 ) -> int:
     """Worst-case token-pool capacity, padded so every BLOCK_M candidate fits."""
     num_max_recv = num_ranks * num_max_tokens_per_rank
@@ -122,9 +125,17 @@ class FusedPlan:
     num_padded_sf_pool_tokens: int
 
 
-def _select_arm(num_sms: int, hidden: int, num_experts: int, num_topk: int, m: int) -> str:
+def _select_arm(
+    num_sms: int, hidden: int, num_experts: int, num_topk: int, m: int
+) -> str:
     for sms, h, e, k, lo, hi, arm in _ALLM_ARMS:
-        if sms == num_sms and h == hidden and e == num_experts and k == num_topk and lo <= m <= hi:
+        if (
+            sms == num_sms
+            and h == hidden
+            and e == num_experts
+            and k == num_topk
+            and lo <= m <= hi
+        ):
             return arm
     return "devm-dynamic"
 
@@ -162,7 +173,9 @@ def select_fused_plan(
     if num_sms not in (H20_NUM_SMS, H200_NUM_SMS):
         raise ValueError(f"MegaMoE supports SM90 H20/H200 only, got num_sms={num_sms}")
     if num_ranks != NUM_RANKS:
-        raise ValueError(f"MegaMoE is an {NUM_RANKS}-rank kernel, got num_ranks={num_ranks}")
+        raise ValueError(
+            f"MegaMoE is an {NUM_RANKS}-rank kernel, got num_ranks={num_ranks}"
+        )
     num_experts_per_rank = num_experts // num_ranks
     if num_experts_per_rank * num_ranks != num_experts:
         raise ValueError("num_experts must be divisible by num_ranks")
@@ -171,28 +184,29 @@ def select_fused_plan(
     if not 0 < num_tokens <= num_max_tokens_per_rank:
         raise ValueError("num_tokens must be in (0, num_max_tokens_per_rank]")
 
-    tuning = None
+    # (block_m, block_n, experts per wave, stages, swap_ab, mode2, single warp)
+    tuning: Optional[Tuple[int, int, int, int, bool, bool, bool]] = None
     if num_sms == H20_NUM_SMS:
         for h, lo, hi, bm, epw, stages, swap, mode2, single in _H20_FUSED_BUCKETS:
             if h == hidden and lo <= num_tokens <= hi:
-                tuning = [bm, 256, epw, stages, swap, mode2, single]
+                tuning = (bm, 256, epw, stages, swap, mode2, single)
                 break
     if tuning is None:
         # Generic dev-m schedule: correct for any geometry, not individually tuned.
         if num_tokens <= 1:
-            tuning = [8, 256, 24, 4, True, True, True]
+            tuning = (8, 256, 24, 4, True, True, True)
         elif num_tokens <= 8:
-            tuning = [8, 256, 16, 4, True, True, True]
+            tuning = (8, 256, 16, 4, True, True, True)
         elif num_tokens <= 16:
-            tuning = [8, 256, 24, 4, True, True, True]
+            tuning = (8, 256, 24, 4, True, True, True)
         elif num_tokens <= 32:
-            tuning = [16, 256, 48, 3, True, True, False]
+            tuning = (16, 256, 48, 3, True, True, False)
         elif num_tokens <= 64:
-            tuning = [24, 256, 48, 3, True, False, True]
+            tuning = (24, 256, 48, 3, True, False, True)
         elif num_tokens <= 256:
-            tuning = [64, 256, 48, 3, False, True, False]
+            tuning = (64, 256, 48, 3, False, True, False)
         else:
-            tuning = [128, 128, 48, 6, False, True, False]
+            tuning = (128, 128, 48, 6, False, True, False)
 
     block_m, block_n, epw, stages, swap_ab, mode2, single_warp = tuning
 
@@ -202,7 +216,12 @@ def select_fused_plan(
         epw += 1
 
     # Pro at BLOCK_M=8 does not fit 4 stages.
-    is_pro = num_experts == 384 and num_topk == 6 and hidden == 7168 and intermediate_hidden == 3072
+    is_pro = (
+        num_experts == 384
+        and num_topk == 6
+        and hidden == 7168
+        and intermediate_hidden == 3072
+    )
     if is_pro and block_m == 8 and stages == 4:
         stages = 3
 
@@ -210,7 +229,9 @@ def select_fused_plan(
     use_interleaved = arm != "static-ss"
     rs_swap_ab = arm == "dynamic-rs" and swap_ab
 
-    push, no_clean = _select_counter_policy(num_sms, hidden, num_experts, num_topk, num_tokens)
+    push, no_clean = _select_counter_policy(
+        num_sms, hidden, num_experts, num_topk, num_tokens
+    )
     if force_push_dispatch is not None:
         push = force_push_dispatch
     if force_no_clean_barrier is not None:
@@ -254,6 +275,7 @@ def select_fused_plan(
         # it must hold the largest layout any BLOCK_M candidate can produce --
         # not the one this plan happens to use.
         num_padded_sf_pool_tokens=max(
-            get_num_padded_sf_pool_tokens(num_max_pool_tokens, bm) for bm in CANDIDATE_BLOCK_M
+            get_num_padded_sf_pool_tokens(num_max_pool_tokens, bm)
+            for bm in CANDIDATE_BLOCK_M
         ),
     )

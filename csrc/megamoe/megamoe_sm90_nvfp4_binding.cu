@@ -16,16 +16,15 @@ using tvm::ffi::TensorView;
 
 namespace flashinfer::megamoe {
 
-void sm90_nvfp4_mega_moe_fused_launch(
-    void* y, int* cumulative_local_expert_recv_stats, int num_tokens,
-    const std::vector<int64_t>& sym_buffer_ptrs, int rank_idx,
-    void* l1_acts, void* l1_acts_sf, void* l2_acts, void* l2_acts_sf,
-    void* l1_weights, void* l2_weights,
-    int64_t l1_acts_stride, int64_t l2_acts_stride,
-    int64_t l1_weights_inner, int64_t l1_weights_stride,
-    int64_t l2_weights_inner, int64_t l2_weights_stride,
-    const float* l1_global_scales, const float* l2_global_scales,
-    cudaStream_t stream);
+void sm90_nvfp4_mega_moe_fused_launch(void* y, int* cumulative_local_expert_recv_stats,
+                                      int num_tokens, const std::vector<int64_t>& sym_buffer_ptrs,
+                                      int rank_idx, void* l1_acts, void* l1_acts_sf, void* l2_acts,
+                                      void* l2_acts_sf, void* l1_weights, void* l2_weights,
+                                      int64_t l1_acts_stride, int64_t l2_acts_stride,
+                                      int64_t l1_weights_inner, int64_t l1_weights_stride,
+                                      int64_t l2_weights_inner, int64_t l2_weights_stride,
+                                      const float* l1_global_scales, const float* l2_global_scales,
+                                      cudaStream_t stream);
 
 namespace {
 namespace cfg = ::flashinfer::megamoe::config;
@@ -55,8 +54,8 @@ Array<int64_t> megamoe_sm90_nvfp4_symm_buffer_layout() {
   constexpr int kNumRanks = 8;
   constexpr int kNumExpertsPerRank = cfg::kNumExperts / kNumRanks;
 
-  const layout::Workspace workspace(nullptr, kNumRanks, cfg::kNumExperts,
-                                    cfg::kNumMaxTokensPerRank, cfg::kNumTopk);
+  const layout::Workspace workspace(nullptr, kNumRanks, cfg::kNumExperts, cfg::kNumMaxTokensPerRank,
+                                    cfg::kNumTopk);
 
   const layout::Data fp8_token(cfg::kHidden);
   const layout::Data fp8_sf(cfg::kHidden / 32);
@@ -90,18 +89,15 @@ Array<int64_t> megamoe_sm90_nvfp4_symm_buffer_layout() {
 
 /*! \brief Plan constants this module was compiled for (for assertions in Python). */
 Array<int64_t> megamoe_sm90_nvfp4_plan() {
-  return Array<int64_t>({static_cast<int64_t>(cfg::kBlockM), static_cast<int64_t>(cfg::kBlockN),
-                         static_cast<int64_t>(cfg::kNumStages),
-                         static_cast<int64_t>(cfg::kNumExpertsPerWave),
-                         static_cast<int64_t>(cfg::kPushDispatch),
-                         static_cast<int64_t>(cfg::kNoCleanBarrier),
-                         static_cast<int64_t>(cfg::kUseInterleavedScheduler),
-                         static_cast<int64_t>(cfg::kRSSwapAB)});
+  return Array<int64_t>(
+      {static_cast<int64_t>(cfg::kBlockM), static_cast<int64_t>(cfg::kBlockN),
+       static_cast<int64_t>(cfg::kNumStages), static_cast<int64_t>(cfg::kNumExpertsPerWave),
+       static_cast<int64_t>(cfg::kPushDispatch), static_cast<int64_t>(cfg::kNoCleanBarrier),
+       static_cast<int64_t>(cfg::kUseInterleavedScheduler), static_cast<int64_t>(cfg::kRSSwapAB)});
 }
 
-void megamoe_sm90_nvfp4_fused(TensorView y, TensorView symm_buffer,
-                              Array<int64_t> symm_buffer_ptrs, int64_t rank_idx,
-                              TensorView l1_weights, TensorView l2_weights,
+void megamoe_sm90_nvfp4_fused(TensorView y, TensorView symm_buffer, Array<int64_t> symm_buffer_ptrs,
+                              int64_t rank_idx, TensorView l1_weights, TensorView l2_weights,
                               Array<int64_t> offsets, int64_t num_tokens,
                               Optional<TensorView> cumulative_local_expert_recv_stats,
                               Optional<TensorView> l1_global_scales,
@@ -140,4 +136,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(megamoe_sm90_nvfp4_fused,
                               flashinfer::megamoe::megamoe_sm90_nvfp4_fused);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(megamoe_sm90_nvfp4_symm_buffer_layout,
                               flashinfer::megamoe::megamoe_sm90_nvfp4_symm_buffer_layout);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(megamoe_sm90_nvfp4_plan, flashinfer::megamoe::megamoe_sm90_nvfp4_plan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(megamoe_sm90_nvfp4_plan,
+                              flashinfer::megamoe::megamoe_sm90_nvfp4_plan);

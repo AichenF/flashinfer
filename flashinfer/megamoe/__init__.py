@@ -25,12 +25,27 @@ __all__ = ["MegaMoESymmBuffer", "nvfp4_mega_moe", "select_fused_plan", "FusedPla
 
 
 @functools.cache
-def _get_module(plan: FusedPlan, num_sms: int, num_max_tokens_per_rank: int,
-                num_experts: int, num_topk: int, hidden: int, intermediate_hidden: int,
-                activation_clamp: float, fast_math: bool):
+def _get_module(
+    plan: FusedPlan,
+    num_sms: int,
+    num_max_tokens_per_rank: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+    activation_clamp: float,
+    fast_math: bool,
+):
     return gen_megamoe_sm90_nvfp4_module(
-        plan, num_sms, num_max_tokens_per_rank, num_experts, num_topk, hidden,
-        intermediate_hidden, activation_clamp, fast_math,
+        plan,
+        num_sms,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        activation_clamp,
+        fast_math,
     ).build_and_load()
 
 
@@ -39,13 +54,23 @@ class MegaMoESymmBuffer:
     combine staging area. All ranks must allocate it identically; the kernel
     reaches peer ranks through the rendezvous'd pointers."""
 
-    def __init__(self, group, num_experts: int, num_max_tokens_per_rank: int,
-                 num_topk: int, hidden: int, intermediate_hidden: int,
-                 activation_clamp: float = 10.0, fast_math: bool = True):
+    def __init__(
+        self,
+        group,
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+        num_topk: int,
+        hidden: int,
+        intermediate_hidden: int,
+        activation_clamp: float = 10.0,
+        fast_math: bool = True,
+    ):
         import torch.distributed._symmetric_memory as symm_mem
 
         if group.size() != 8:
-            raise ValueError(f"MegaMoE is an 8-rank kernel, got world size {group.size()}")
+            raise ValueError(
+                f"MegaMoE is an 8-rank kernel, got world size {group.size()}"
+            )
 
         self.group = group
         self.num_experts = num_experts
@@ -55,16 +80,33 @@ class MegaMoESymmBuffer:
         self.intermediate_hidden = intermediate_hidden
         self.activation_clamp = activation_clamp
         self.fast_math = fast_math
-        self.num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        self.num_sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
 
         # The buffer layout depends only on the shape, not on the per-call plan,
         # so any plan for this shape yields the same offsets. Use M=1.
         probe_plan = select_fused_plan(
-            self.num_sms, group.size(), num_experts, num_topk, hidden,
-            intermediate_hidden, num_max_tokens_per_rank, 1,
+            self.num_sms,
+            group.size(),
+            num_experts,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            num_max_tokens_per_rank,
+            1,
         )
-        mod = _get_module(probe_plan, self.num_sms, num_max_tokens_per_rank, num_experts,
-                          num_topk, hidden, intermediate_hidden, activation_clamp, fast_math)
+        mod = _get_module(
+            probe_plan,
+            self.num_sms,
+            num_max_tokens_per_rank,
+            num_experts,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            activation_clamp,
+            fast_math,
+        )
         layout = list(mod.megamoe_sm90_nvfp4_symm_buffer_layout())
         self._offsets = layout
         num_bytes = layout[0]
@@ -77,10 +119,18 @@ class MegaMoESymmBuffer:
         group.barrier()
         torch.cuda.synchronize()
 
-        self.x = self._view(layout[1], (num_max_tokens_per_rank, hidden), torch.float8_e4m3fn)
-        self.x_sf = self._view(layout[2], (num_max_tokens_per_rank, hidden // 128), torch.float32)
-        self.topk_idx = self._view(layout[3], (num_max_tokens_per_rank, num_topk), torch.int64)
-        self.topk_weights = self._view(layout[4], (num_max_tokens_per_rank, num_topk), torch.float32)
+        self.x = self._view(
+            layout[1], (num_max_tokens_per_rank, hidden), torch.float8_e4m3fn
+        )
+        self.x_sf = self._view(
+            layout[2], (num_max_tokens_per_rank, hidden // 128), torch.float32
+        )
+        self.topk_idx = self._view(
+            layout[3], (num_max_tokens_per_rank, num_topk), torch.int64
+        )
+        self.topk_weights = self._view(
+            layout[4], (num_max_tokens_per_rank, num_topk), torch.float32
+        )
 
     def _view(self, byte_offset: int, shape: Tuple[int, ...], dtype: torch.dtype):
         itemsize = torch.empty((), dtype=dtype).element_size()
@@ -90,8 +140,13 @@ class MegaMoESymmBuffer:
         flat = self.buffer[byte_offset : byte_offset + numel * itemsize]
         return flat.view(dtype).view(*shape)
 
-    def stage(self, x_fp8: torch.Tensor, x_sf: torch.Tensor,
-              topk_idx: torch.Tensor, topk_weights: torch.Tensor) -> None:
+    def stage(
+        self,
+        x_fp8: torch.Tensor,
+        x_sf: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
         """Copy this rank's tokens and routing into the symmetric buffer."""
         m = x_fp8.shape[0]
         self.x[:m].copy_(x_fp8)
@@ -132,17 +187,39 @@ def nvfp4_mega_moe(
     m = int(num_tokens if num_tokens is not None else y.shape[0])
 
     plan = select_fused_plan(
-        b.num_sms, b.group.size(), b.num_experts, b.num_topk, b.hidden,
-        b.intermediate_hidden, b.num_max_tokens_per_rank, m,
+        b.num_sms,
+        b.group.size(),
+        b.num_experts,
+        b.num_topk,
+        b.hidden,
+        b.intermediate_hidden,
+        b.num_max_tokens_per_rank,
+        m,
         force_push_dispatch=force_push_dispatch,
         force_no_clean_barrier=force_no_clean_barrier,
     )
-    mod = _get_module(plan, b.num_sms, b.num_max_tokens_per_rank, b.num_experts,
-                      b.num_topk, b.hidden, b.intermediate_hidden,
-                      b.activation_clamp, b.fast_math)
+    mod = _get_module(
+        plan,
+        b.num_sms,
+        b.num_max_tokens_per_rank,
+        b.num_experts,
+        b.num_topk,
+        b.hidden,
+        b.intermediate_hidden,
+        b.activation_clamp,
+        b.fast_math,
+    )
     mod.megamoe_sm90_nvfp4_fused(
-        y, b.buffer, b.handle.buffer_ptrs, b.group.rank(),
-        l1_weights, l2_weights, b._offsets, m,
-        cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales,
+        y,
+        b.buffer,
+        b.handle.buffer_ptrs,
+        b.group.rank(),
+        l1_weights,
+        l2_weights,
+        b._offsets,
+        m,
+        cumulative_local_expert_recv_stats,
+        l1_global_scales,
+        l2_global_scales,
     )
     return y
