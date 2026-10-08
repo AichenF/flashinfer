@@ -118,4 +118,8 @@ def gen_megamoe_sm90_nvfp4_module(
         ],
         extra_cflags=["-std=c++20"],
         extra_include_paths=[gen_directory, jit_env.FLASHINFER_CSRC_DIR],
+        # kFastMath only switches expf/division in the source; the module-wide
+        # -use_fast_math must follow it, or nvcc rewrites the precise branch
+        # into intrinsics and flushes denormals anyway.
+        use_fast_math=fast_math,
     )
