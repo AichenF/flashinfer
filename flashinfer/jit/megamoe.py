@@ -308,4 +308,8 @@ def gen_megamoe_sm90_nvfp4_split_module(
         ],
         extra_cflags=["-std=c++20"],
         extra_include_paths=[gen_directory, jit_env.FLASHINFER_CSRC_DIR],
+        # The split kernels are built without -use_fast_math even when
+        # kFastMath is set: kFastMath already selects __expf/fast_rcp in the
+        # source, and the flag would only add denormal flushing on top.
+        use_fast_math=False,
     )
