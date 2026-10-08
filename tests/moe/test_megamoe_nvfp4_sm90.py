@@ -4,7 +4,8 @@ Runs the FlashInfer kernel and the DeepGEMM reference on identical inputs and
 weights and requires bit-identical output -- both drive the same CUDA kernel, so
 any difference is a host-side (layout / descriptor / plan) bug.
 
-Requires 8 GPUs:  torchrun --nproc-per-node=8 tests/moe/test_megamoe_nvfp4_sm90.py
+Requires 8 GPUs. The script spawns its own worker per GPU, so run it with plain
+python, not torchrun:  python tests/moe/test_megamoe_nvfp4_sm90.py
 """
 
 import argparse
