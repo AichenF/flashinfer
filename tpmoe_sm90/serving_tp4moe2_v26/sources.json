@@ -1,0 +1,17 @@
+{
+ "variant": "tp4moe2_v26",
+ "origin": "pr13_h20/tp4moe2_shared: tp4moe2_v24.cu (sh) + tp4moe2_v23.cu -DTP2_SHARED=0 (ns)",
+ "extension_sh": "tp4moe2_v24_srv",
+ "extension_ns": "tp4moe2_v23ns_srv",
+ "sha256": {
+  "tp4moe2_sh.cu": "6599d67be333bc3fb6cdd2b41f2ac44a5f377f5ac7a58f4f93e72c78450045be",
+  "tp4moe2_ns.cu": "deaebb1c42f4aaff7fd19fa85d19e4cb024a9d2276486c1ac6f9b6ef154883e3",
+  "chain4.cuh": "8e9f0e5584f9361936ad0a8dc32fd57d0c06967463b5c94f32a946324b378c55",
+  "kpipe.cuh": "f59adf8456b89b57f118ef09f85258df06512edb7cd76f5e0ff5edfb20d5a2f2",
+  "chain_ss.cuh": "9e17d619b4a3398cf6bdf927f1894aff781a2898b2af67cea5aee19fb47bc800",
+  "shared_num.cuh": "5e1b95cfb89a37f22e1de5cd9d491e393357566670df628b28d17753108bf7f9",
+  "tp4moe2.py": "27f7a1a3603729cd6ff02dc1d00757d5b93a519bea77c782413c790e0e4874c6",
+  "tp4_ext.py": "d20d782c7e544d2282e4250226105c6073de650008bd4042937ba6f67827bd09",
+  "tp4_lazy.py": "1ae81b32015558987bfc798c95c7fbe086e2375ecd3d6314c5de9d8991bde125"
+ }
+}
