@@ -74,14 +74,14 @@ class RankState:
             self.ag_buf = torch.zeros(self.AG_BYTES() // 4, dtype=torch.int32, **z)
 
     @staticmethod
-    def RS_BYTES():
+    def RS_BYTES():   # two epoch-parity halves (kernel RS_PAR): a rank one call ahead never overwrites a peer's pending messages
         E = ext()
-        return 16 * E.MAXM * E.NMSG * 16
+        return 2 * 16 * E.MAXM * E.NMSG * 16
 
     @staticmethod
-    def AG_BYTES():
+    def AG_BYTES():   # (same two halves, kernel AG_PAR)
         E = ext()
-        return E.NRT * E.MAXM * E.NMSG * 16
+        return 2 * E.NRT * E.MAXM * E.NMSG * 16
 
     def link_ptrs(self, rs_ptrs, ag_ptrs):
         self.rs_ptrs = [int(p) for p in rs_ptrs]
