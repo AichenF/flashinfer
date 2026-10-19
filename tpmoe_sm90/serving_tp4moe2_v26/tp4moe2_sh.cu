@@ -205,8 +205,8 @@ struct alignas(64) Params {
     unsigned* rt_cnt;                        // [2][NRT] FC2 row-tile completion counters (epoch parity)
     unsigned* work;                          // [0] epoch, [1 + parity] CTA done counters
     __nv_bfloat16* outp;                     // [MAXM][TOPK_MAX][4096] per-slot expert outputs
-    uint4* rs[4];                            // peer reduce-scatter buffers [4 src][4 lrt][MAXM][43]
-    uint4* ag[4];                            // peer all-gather buffers [16 rtile][MAXM][43]
+    uint4* rs[4];                            // peer reduce-scatter buffers [2 epoch parity][4 src][4 lrt][MAXM][43] (one-shot: [4 src][16 rtile][OS_MAXM][43])
+    uint4* ag[4];                            // peer all-gather buffers [2 epoch parity][16 rtile][MAXM][43]
     __nv_bfloat16* out;                      // [M][4096]
     int M, n_exp, my_rank, ndev;
     int dense, md;                           // dense mode (small M): FC1 B operand = x rows 0..md-1 for every expert, no gather
@@ -2255,6 +2255,12 @@ __device__ __forceinline__ size_t ag_idx(int rtile, int t, int m) { return ((siz
 constexpr int OS_MAXM = 128;
 static_assert(4 * NRT * OS_MAXM <= 16 * MAXM, "one-shot messages fit the RS buffer");
 __device__ __forceinline__ size_t os_idx(int src, int rtile, int t, int m) { return ((size_t)((src * NRT + rtile) * OS_MAXM + t)) * NMSG + m; }
+// Both buffers are double-buffered by epoch parity (host: RankState.RS_BYTES / AG_BYTES hold two halves).  A rank that has
+// pushed its messages but not yet read its peers' (preempted between T1 and the reduce) does not hold up its peers, which can
+// finish this call and push the next one into its buffer: with a single buffer the pending messages would be overwritten (the
+// epoch tags never match again, the rank spins forever).  No rank can get two calls ahead, so two halves suffice.
+constexpr size_t RS_PAR = (size_t)16 * MAXM * NMSG;   // uint4 per parity half
+constexpr size_t AG_PAR = (size_t)NRT * MAXM * NMSG;
 
 // T1 message m of (row tile, token t): slot-ordered fp32 sum x routing weight, x factor -> BF16, + shared -> BF16, then (ndev 1) the
 // output, (one-shot) a copy to every rank, (RS) the row tile's owner rank
@@ -2310,10 +2316,11 @@ __device__ __forceinline__ void t1_finish(const Params& P, int rtile, int t, int
         o[0] = msg.x; o[1] = msg.y;
         if (full6) o[2] = msg.z;
     } else if (P.oneshot) {
+        const size_t pb = (epoch & 1u) * RS_PAR;
 #pragma unroll
-        for (int d = 0; d < 4; ++d) st_ll(P.rs[(P.my_rank + d) & 3] + os_idx(P.my_rank, rtile, t, m), msg);   // own copy first
+        for (int d = 0; d < 4; ++d) st_ll(P.rs[(P.my_rank + d) & 3] + pb + os_idx(P.my_rank, rtile, t, m), msg);   // own copy first
     } else {
-        st_ll(P.rs[rtile >> 2] + rs_idx(P.my_rank, rtile & 3, t, m), msg);
+        st_ll(P.rs[rtile >> 2] + (epoch & 1u) * RS_PAR + rs_idx(P.my_rank, rtile & 3, t, m), msg);
     }
 }
 __device__ __forceinline__ void t1_msg(const Params& P, const Tabs& T, int rtile, int t, int m, unsigned epoch) {
@@ -2391,7 +2398,7 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
     (void)need;
     if (P.oneshot) {   // every (row tile, token) of this CTA: the 4 ranks' messages, summed in rank order (fp32), one BF16 RN
         const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
-        const uint4* rs_me = P.rs[P.my_rank];
+        const uint4* rs_me = P.rs[P.my_rank] + par * RS_PAR;
         for (int x = tid; x < mine * NMSG; x += NCONS) {
             const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
             uint4 v[4];
@@ -2418,7 +2425,7 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
     // T2: owner reduce in rank order (fp32 from rank 0's value, one BF16 RN), all-gather push
     {
         const int npair = 4 * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
-        const uint4* rs_me = P.rs[P.my_rank];
+        const uint4* rs_me = P.rs[P.my_rank] + par * RS_PAR;
         for (int x = tid; x < mine * NMSG; x += NCONS) {
             const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, lrt = j / M, t = j - lrt * M;
             uint4 v[4];
@@ -2438,14 +2445,14 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
             const uint4 mo = make_uint4(pack_bf16x2_rn(a[0], a[1]), pack_bf16x2_rn(a[2], a[3]), pack_bf16x2_rn(a[4], a[5]), epoch);
             const int rtile = P.my_rank * 4 + lrt;
 #pragma unroll
-            for (int d = 0; d < 4; ++d) st_ll(P.ag[d] + ag_idx(rtile, t, m), mo);
+            for (int d = 0; d < 4; ++d) st_ll(P.ag[d] + par * AG_PAR + ag_idx(rtile, t, m), mo);
         }
     }
     STAMP(P, 5);
     // T3: pull the reduced rows
     {
         const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
-        const uint4* ag_me = P.ag[P.my_rank];
+        const uint4* ag_me = P.ag[P.my_rank] + par * AG_PAR;
         for (int x = tid; x < mine * NMSG; x += NCONS) {
             const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
             uint4 v;
