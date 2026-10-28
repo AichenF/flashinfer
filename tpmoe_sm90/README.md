@@ -1,4 +1,4 @@
-# tpmoe_sm90: TP4 fused MoE decode kernel for H20 (sm_90a)
+# tpmoe_sm90: TP4 fused MoE decode kernel for H20 and H100 (sm_90a)
 
 `serving_tp4moe2_v26/` is the frozen serving package of `tp4moe2`. It is a
 persistent TP4 MoE kernel for DeepSeek-V4-Flash Decode on four H20 GPUs.
@@ -86,3 +86,62 @@ Decode:
 All cells are beyond the A/B/A noise floor. Start-up shadow gate against
 stock Humming over 4,920 (layer, M) cases: worst rel RMS 0.0235, worst
 per-token rel 0.051.
+
+## H100 (`serving_tp4moe2_h100/`)
+
+The same hook and kernel structure, retuned for four H100 SXM GPUs (TP4).
+Differences from `serving_tp4moe2_v26/`:
+
+- `tp4moe2_ns.cu` is a later kernel (`tpmoe_v94ex_h100`) with the
+  epoch-parity LL all-reduce buffers. Both builds come from this one source:
+  `sh` uses the default `TP2_SHARED=1`, `ns` adds `-DTP2_SHARED=0`. It also
+  needs `kpipe_w.cuh`. Both builds use 96 registers and do not spill.
+- Its output is bitwise identical to the v28 TP4 kernel. This was checked
+  rank-local on all four ranks for M 1..512, and in a 4-GPU layer A/B for
+  both builds.
+- The shared-expert policy has a new knob, `FAC_TP4_SH_FUSED_FROMM`. The
+  shared expert is fused when M <= `FAC_TP4_SH_FUSED_MAXM` or
+  M >= `FAC_TP4_SH_FUSED_FROMM`. The defaults depend on the GPU, detected
+  from the device name:
+  - H100 TP4: 21 / 33
+  - H20 TP4: 32 / off (unchanged)
+
+  `FAC_TP4_INSTALLED` logs both values.
+- The hook and `build.py` also accept TP8 (`-DTP2_NDEV=8`). This package's
+  TP8 path has not been measured.
+
+Use it as described above, with `serving_tp4moe2_h100` in the path. Build
+TP4 only with `python3 serving_tp4moe2_h100/build.py 4`.
+
+### Measured (DeepSeek-V4-Flash, 4x H100 SXM, NVLink full mesh)
+
+The table gives the MoE layer time in us for layer 20 on captured Decode
+activations:
+
+- Runs are CUDA graphs, with rotating weight copies so L2 is cold.
+- Each figure is the median of the slowest rank.
+- Humming is the production path: router GEMM + `moe_fused_gate` + Humming
+  routed experts, the shared expert on the alternate stream, and SGLang's
+  custom all-reduce.
+- Both tpmoe columns include the same router GEMM and shared expert.
+
+| M | Humming | v28, H20 policy | this package | change vs v28 |
+|---|---|---|---|---|
+| 1 | 46.7 | 39.7 | 39.1 | -1.5% |
+| 6 | 85.4 | 66.6 | 65.4 | -1.8% |
+| 16 | 128.4 | 104.0 | 98.7 | -5.1% |
+| 20 | 143.7 | 119.5 | 112.7 | -5.7% |
+| 24 | 148.8 | 124.9 | 113.6 | -9.0% |
+| 32 | 165.9 | 139.4 | 122.0 | -12.5% |
+| 48 | 197.9 | 162.9 | 141.7 | -13.0% |
+| 64 | 223.2 | 178.0 | 159.2 | -10.6% |
+| 96 | 278.9 | 207.4 | 184.5 | -11.0% |
+| 128 | 301.6 | 228.7 | 205.5 | -10.1% |
+| 192 | 347.2 | 251.8 | 228.7 | -9.2% |
+| 256 | 382.8 | 273.5 | 251.8 | -7.9% |
+| 384 | 432.8 | 307.3 | 287.4 | -6.5% |
+| 512 | 466.3 | 341.9 | 321.9 | -5.8% |
+
+The mean speed-up over Humming across these 14 M values goes from 1.283x
+(v28) to 1.394x (this package). End-to-end serving on H100 has not been
+measured.

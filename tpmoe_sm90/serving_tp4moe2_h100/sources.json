@@ -1,0 +1,19 @@
+{
+ "variant": "tpmoe_v94ex_h100",
+ "origin": "H100 TP4 (computelab 10-27): tp4moe2_ns.cu = dev tp4moe2_v94ex.cu = v94p11dev (TP8 line, NDEV-generic) + LL epoch-parity double buffers (port of fork d0a94547) + TP2_SH_FIRST 0 + TP2_SMALL_MAXMT 128 (both v28 stream-K partitions); built for TP4. Bitwise == v28 (the current TP4 kernel): rank-local all 4 ranks x M 1..512 (sh build) and 4-GPU layer A/B (sh + ns, 32 M).",
+ "extension_sh": "tpmoe_v94exsh_h100",
+ "extension_ns": "tpmoe_v94exns_h100",
+ "sha256": {
+  "tp4moe2_ns.cu": "bba973fbf88fb6d503f0c7aa51f1fe9a08138c11d911fb232a13fc51316eac02",
+  "chain4.cuh": "8e9f0e5584f9361936ad0a8dc32fd57d0c06967463b5c94f32a946324b378c55",
+  "kpipe.cuh": "f59adf8456b89b57f118ef09f85258df06512edb7cd76f5e0ff5edfb20d5a2f2",
+  "kpipe_w.cuh": "3e2f8f0d541817e0138e24d613166395980bcf6b79a463cc44e8973f7de24294",
+  "chain_ss.cuh": "9e17d619b4a3398cf6bdf927f1894aff781a2898b2af67cea5aee19fb47bc800",
+  "shared_num.cuh": "5e1b95cfb89a37f22e1de5cd9d491e393357566670df628b28d17753108bf7f9",
+  "tp4moe2.py": "f14c3a3136f0fb54a99b5b04bc800b7c54e76d4867a9b74234e4f9147ad25dab",
+  "tp4_ext.py": "20aa961a2badb7764ba71824ba68376d702ac8055c10ba24721c6d8a093ab0bf",
+  "tp4_lazy.py": "1ae81b32015558987bfc798c95c7fbe086e2375ecd3d6314c5de9d8991bde125",
+  "install_tp4moe2.py": "8f6f63d44141d865911abe1d57ef688b4743f9aae778765f3e23ab75d3e0c1eb",
+  "build.py": "f57087ade680ae733fc4479ecce7d8df62d7f6c3df41cab2f2fdc7f769d1c362"
+ }
+}
