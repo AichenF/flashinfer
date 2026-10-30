@@ -52,6 +52,7 @@ class RankState:
         self.xflag = torch.zeros(2 * E.MAXM, dtype=torch.int32, **z)
         self.gcnt = torch.zeros(2, dtype=torch.int32, **z)
         self.pan_cnt = torch.zeros(2 * E.MAXP, dtype=torch.int32, **z)
+        self.rdy = torch.zeros(2 * (E.MAXP + 32), dtype=torch.int32, **z)
         self.fc2_next = torch.zeros(4, dtype=torch.int32, **z)
         self.rt_cnt = torch.zeros(2 * E.NRT, dtype=torch.int32, **z)
         self.work = torch.zeros(4, dtype=torch.int32, **z)
@@ -108,7 +109,7 @@ def run(st, W, x, out, glog=None, gbias=None, ids=None, rw=None, shared=None, fa
     else:
         ids_t, rw_t = ids, rw
     E.run(W.maps, W.w13_sf, W.w2_sf, st.lanes, x, glog, gbias, ids_t, rw_t, shared, float(factor), st.xq, st.xs, st.xg, st.xgsf, st.dbg, st.himg, st.hsf,
-          st.part, st.part_flags, st.xflag, st.gcnt, st.pan_cnt, st.fc2_next, st.rt_cnt, st.work, st.outp, st.rs, st.ag, out,
+          st.part, st.part_flags, st.xflag, st.gcnt, st.pan_cnt, st.rdy, st.fc2_next, st.rt_cnt, st.work, st.outp, st.rs, st.ag, out,
           st.rank, st.ndev, st.grid, SW.maps if SW else None, SW.sfa1 if SW else None, SW.sfa2 if SW else None,
           st.xgs, st.xgsfs, st.hsimg, st.hssf, st.shout)
     return out

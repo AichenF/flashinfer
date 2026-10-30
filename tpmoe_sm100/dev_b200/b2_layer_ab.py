@@ -240,7 +240,7 @@ if __name__ == '__main__':
     ap.add_argument('--cap', required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--layer', type=int, default=20)
-    ap.add_argument('--ms', type=int, nargs='+', default=[1, 6, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512])
+    ap.add_argument('--ms', type=int, nargs='+', default=[1, 2, 4, 6, 8, 16, 20, 24, 32, 48, 64, 96, 128])
     ap.add_argument('--copies', type=int, default=4)
     ap.add_argument('--rounds', type=int, default=5)
     ap.add_argument('--arms', nargs='*')

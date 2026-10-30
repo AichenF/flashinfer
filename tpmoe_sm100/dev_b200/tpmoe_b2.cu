@@ -26,10 +26,23 @@
 #include <cstring>
 
 #ifndef TPB2_NS
-#define TPB2_NS tpb2_v12
+#define TPB2_NS tpb2_v16
 #endif
 #ifndef TPB2_SMALLM
 #define TPB2_SMALLM 8   // fused gate: M <= this -> every CTA gates every token itself (no grid-wide routing barrier)
+#endif
+#ifndef TPB2_SHCOST
+#define TPB2_SHCOST 2   // stream-K cost of a shared FC1 stage (2 x 16 KB e4m3) in routed stages (16 KB e2m1)
+#endif
+#ifndef TPB2_MERGE_B
+#define TPB2_MERGE_B 4  // split-K merge: contributors' partial loads in flight together (routed; shared: half)
+#endif
+#ifndef TPB2_RR
+#define TPB2_RR 1   // FC1 work list round-robin over the CTAs (no routed split-K) when there are >= 2 G routed items and the shared quarter
+                    // pieces fit one wave: panels complete in waves, CTAs leaving FC1 early run FC2 of ready panels (0: stream-K always)
+#endif
+#ifndef TPB2_RR_MIN4
+#define TPB2_RR_MIN4 5   // rr when routed items >= TPB2_RR_MIN4 / 4 waves (measured: 5 best at M4 / 6 / 8)
 #endif
 #ifndef TPB2_ONESHOT_MAXM
 #define TPB2_ONESHOT_MAXM 32   // one-shot LL all-reduce for M <= this, else reduce-scatter + all-gather
@@ -117,6 +130,7 @@ struct Params {
     unsigned* xflag;                         // [2][MAXM] quantized 512-element groups of token t (8 = done; epoch parity)
     unsigned* gcnt;                          // [2] gated tokens (epoch parity)
     unsigned* pan_cnt;                       // [2][MAXP] FC1 items done per panel
+    unsigned* rdy;                           // [2][MAXP + 32] panels in the order their h became ready (p + 1; 0 = not yet), [2][MAXP] = slots taken
     unsigned* fc2_next;                      // [4] FC2 unit queue head [par], T1 item queue head [2 + par]
     unsigned* rt_cnt;                        // [2][NRT] FC2 units stored per 256-row tile
     unsigned* work;                          // [0] epoch, [1 + parity] CTA done counters
@@ -161,6 +175,9 @@ __device__ __forceinline__ void wait_eq(const unsigned* p, unsigned v) { while (
 __device__ __forceinline__ void st_release(unsigned* p, unsigned v) { asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory"); }
 __device__ __forceinline__ void red_relaxed_add(unsigned* p, unsigned v) { asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory"); }
 __device__ __forceinline__ void red_release_add(unsigned* p, unsigned v) { asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory"); }
+__device__ __forceinline__ unsigned atom_add_acq_rel(unsigned* p, unsigned v) {
+    unsigned r; asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], %2;" : "=r"(r) : "l"(p), "r"(v) : "memory"); return r;
+}
 __device__ __forceinline__ void fence_acq_rel() { asm volatile("fence.acq_rel.gpu;" ::: "memory"); }
 __device__ __forceinline__ void fence_proxy_async_global() { asm volatile("fence.proxy.async.global;" ::: "memory"); }
 __device__ __forceinline__ void fence_proxy_async_smem() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
@@ -690,6 +707,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
     const unsigned epoch = __ldcg(P.work) + 1u, par = epoch & 1u;
     if (b == 0) {   // the next launch's parity set (the previous launch, its user, has completed)
         for (int i = tid; i < MAXP; i += THREADS) P.pan_cnt[(par ^ 1u) * MAXP + i] = 0u;
+        for (int i = tid; i < MAXP + 32; i += THREADS) P.rdy[(par ^ 1u) * (MAXP + 32) + i] = 0u;
         for (int i = tid; i < MAXM; i += THREADS) P.xflag[(par ^ 1u) * MAXM + i] = 0u;
         if (tid < NRT) P.rt_cnt[(par ^ 1u) * NRT + tid] = 0u;
         if (tid == NRT) P.work[1 + (par ^ 1u)] = 0u;
@@ -726,19 +744,24 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
     __syncthreads();
     build_tables(P, smem, T, small ? gids : nullptr);
     if (P.dbg && tid == 0) P.dbg[b * 32 + 1] = gtime();
-    quant_x(P, T.tke, P.xflag + par * MAXM, lane, warp * G + b, (THREADS / 32) * G);   // x -> MXFP8, scattered into its panels' images
+    quant_x(P, T.tke, P.xflag + par * MAXM, lane, warp * G + b, (THREADS / 32) * G);   // x -> MXFP8 (+ shared per-128), into its panels' images
     if (P.dbg && tid == 0) P.dbg[b * 32 + 2] = gtime();
     const int Ptot = T.misc[2];
     const int Psh = P.shw ? (M + NMAX - 1) / NMAX : 0;   // shared panels (FC1 items / FC2 units after the routed ones)
     if (tid == 0) T.misc[4] = Psh;
     // FC1 stream-K over cost units: a routed stage (16 KB of e2m1) = 1, a shared stage (2 x 16 KB of e4m3) = 2.  Unified stage index:
     // routed stages [0, R1), shared [R1, R1 + S1); CTA b's range = the stages of its cost range [totc b / G, totc (b + 1) / G)
-    const int R1 = Ptot * NT1 * NSTG1, S1 = Psh * NT1S * NSTG1S, totc = R1 + 2 * S1;
-    auto ustart = [&](int c) { const int x = fc1_lo(totc, c, G); return x < R1 ? x : R1 + (x - R1) / 2; };
+    const int R1 = Ptot * NT1 * NSTG1, S1 = Psh * NT1S * NSTG1S, totc = R1 + TPB2_SHCOST * S1;
+    auto ustart = [&](int c) { const int x = fc1_lo(totc, c, G); return x < R1 ? x : R1 + (x - R1) / TPB2_SHCOST; };
     // FC2 unit width: the widest of 4 / 2 / 1 row tiles that still gives every CTA >= 2 units
     const int Pall = Ptot + Psh;
     const int fc2g = Pall * (NRT2 / 4) >= 2 * G ? 4 : (Pall * (NRT2 / 2) >= 2 * G ? 2 : 1), nrg = NRT2 / fc2g;
     const int lo = ustart(b), hi = ustart(b + 1);
+    // round-robin FC1 (rr): work list j = shared quarter pieces (Psh x 4 items x 4 quarters of 8 chunks: CTA j, the owner of an item is
+    // its quarter 0, the contributors the next 3 CTAs -- every CTA's only shared piece is its first work) then routed items (whole, no
+    // split), entry j on CTA j % G in increasing j
+    const int nshq = Psh * NT1S * 4, nwork = nshq + Ptot * NT1;
+    const bool rr = TPB2_RR && Ptot * NT1 * 4 >= TPB2_RR_MIN4 * G && nshq <= G;
     // tokens of a work descriptor's panel (kinds: 1 routed FC1 piece, 2 routed FC2 unit, 3 shared FC1 piece, 4 shared FC2 unit)
     auto panel_n = [&](const int4& d) -> int {
         int e, n, eb;
@@ -785,7 +808,25 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 bulk_g2s(sb + OFF_SFA + st * KC * 512 + 512, P.sfa1s + (static_cast<size_t>(INTER / 128 + k) * NCH1 + c) * 512, 512, bar(B_FULL + st));
                 ++fills;
             };
-            for (int g = lo; g < hi;) {   // FC1 pieces (unified stage index: routed, then shared)
+            if (rr) {
+                for (int j = b; j < nwork; j += G) {
+                    if (j < nshq) {   // shared quarter piece: item j / 4 (panel j / 16, k = (j / 4) % 4), chunks 8 (j % 4) ..
+                        const int sitem = j >> 2, s0 = (j & 3) * (NSTG1S / 4), s1 = s0 + NSTG1S / 4;
+                        push(make_int4(3, sitem, s0, s1));
+                        for (int s = s0; s < s1; ++s) stage_s1(sitem % NT1S, s);
+                    } else {
+                        const int item = j - nshq;
+                        push(make_int4(1, item, 0, NSTG1));
+                        const int p = item / NT1, tile = item % NT1;
+                        int e, n, eb;
+                        panel_of(T, p, e, n, eb);
+                        for (int s = 0; s < NSTG1; ++s)
+                            stage(&P.map1, e * (2 * INTER) + tile * 128, KC * s,
+                                  P.w13_sf + ((static_cast<size_t>(e) * NT1 + tile) * NCH1 + KC * s) * 512, KC * 8192);
+                    }
+                }
+            }
+            for (int g = rr ? hi : lo; g < hi;) {   // FC1 pieces (unified stage index: routed, then shared)
                 if (g < R1) {
                     const int item = g / NSTG1, s0 = g % NSTG1, s1 = min(NSTG1, hi - item * NSTG1);
                     push(make_int4(1, item, s0, s1));
@@ -808,24 +849,25 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
             const int units = Pall * nrg;
             // one ticket ahead, and its panel's h flag loaded as soon as the ticket arrives (both round trips under the current unit's
             // loads); the unit is pushed only once its panel's 8 FC1 items are in (acquired here: the B warp only fences the proxy)
-            const unsigned* pc = P.pan_cnt + par * MAXP;
+            // units in the order panels become ready: ticket u -> ready-list slot u / nrg (the panel whose h was completed (u / nrg)-th),
+            // row group u % nrg.  One ticket ahead, its slot loaded as soon as the ticket arrives
+            const unsigned* rl = P.rdy + par * (MAXP + 32);
             int tq = static_cast<int>(atomicAdd(P.fc2_next + par, 1u));
-            unsigned pf = tq < units ? ld_relaxed(pc + tq / nrg) : 0u;
+            unsigned pf = tq < units ? ld_relaxed(rl + tq / nrg) : 0u;
             for (;;) {   // FC2 units (row group rg of fc2g row tiles, panel p) from the queue
                 const int u = tq;
                 if (u >= units) break;
-                const int p = u / nrg, rg = u - p * nrg;   // panel-major: early tickets use the panels whose FC1 finishes first
-                const unsigned nitems = p < Ptot ? static_cast<unsigned>(NT1) : static_cast<unsigned>(NT1S);
-                if (!((T.prdy[p >> 5] >> (p & 31)) & 1u)) {
+                const int rg = u % nrg;
+                if (pf == 0u) {
                     const unsigned long long tw = P.dbg ? gtime() : 0ull;
-                    if (pf >= nitems) fence_acq_rel();
-                    else wait_ge(pc + p, nitems);
-                    T.prdy[p >> 5] |= 1u << (p & 31);
+                    while ((pf = ld_relaxed(rl + u / nrg)) == 0u) {}
                     if (P.dbg) P.dbg[b * 32 + 21] += gtime() - tw;
                 }
-                push(make_int4(p < Ptot ? 2 : 4, u, 0, 0));
+                fence_acq_rel();   // (acquire: the panel's h, released by its finisher)
+                const int p = static_cast<int>(pf) - 1;
+                push(make_int4(p < Ptot ? 2 : 4, p * nrg + rg, 0, 0));
                 tq = static_cast<int>(atomicAdd(P.fc2_next + par, 1u));
-                pf = tq < units ? ld_relaxed(pc + tq / nrg) : 0u;
+                pf = tq < units ? ld_relaxed(rl + tq / nrg) : 0u;
                 if (p < Ptot) {
                     int e, n, eb;
                     panel_of(T, p, e, n, eb);
@@ -1033,6 +1075,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
         const bool up_lane = (lane & 8) == 0;
         const bool pub = warp == 2 && lane == 0;   // the publishing thread
         const int frow = T.lanes[L];
+
         __nv_bfloat16* stg = T.stg + g * 16 * 128;   // FC2 transpose staging [16 tokens][128 rows]
         int w = 0, uses[ACC] = {0, 0, 0, 0}, ab = 0;
         unsigned rt_n[NRT];   // (pub) FC2 row tiles stored per 256-row T1 tile, published once at the end
@@ -1123,16 +1166,43 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 if (s1 < (d.x == 1 ? NSTG1 : NSTG1S)) {   // owner of a split item: add the partials of the CTAs b + 1, .. covering its other stages, in CTA order
                     const int iend = d.x == 1 ? (item + 1) * NSTG1 : R1 + (item + 1) * NSTG1S;   // (unified stage index)
                     int cend = b + 1;
-                    while (cend < G && ustart(cend) < iend) ++cend;
+                    if (rr) cend = b + 4;   // (rr: only shared items are split, in 4 quarters on CTAs b .. b + 3)
+                    else while (cend < G && ustart(cend) < iend) ++cend;
                     for (int c = b + 1 + lane; c < cend; c += 32) wait_eq(P.part_flags + c, epoch);
                     __syncwarp();
-                    for (int c = b + 1; c < cend; ++c) {
-                        const float* pp = P.part + static_cast<size_t>(c) * 2 * NMAX * 128;
+                    if (d.x == 1) {
+                        constexpr int MB = TPB2_MERGE_B;
+                        for (int c0 = b + 1; c0 < cend; c0 += MB) {   // MB contributors' partials loaded together, added in CTA order
+                            float pv[MB][16];
 #pragma unroll
-                        for (int i = 0; i < 16; ++i) if (tb + i < npad) v[i] += __ldcg(pp + (tb + i) * 128 + L);
-                        if (d.x == 3) {
+                            for (int j = 0; j < MB; ++j) {
+                                const float* pp = P.part + static_cast<size_t>(c0 + j) * 2 * NMAX * 128;
 #pragma unroll
-                            for (int i = 0; i < 16; ++i) if (tb + i < npad) vu[i] += __ldcg(pp + (NMAX + tb + i) * 128 + L);
+                                for (int i = 0; i < 16; ++i) pv[j][i] = (c0 + j < cend && tb + i < npad) ? __ldcg(pp + (tb + i) * 128 + L) : 0.f;
+                            }
+#pragma unroll
+                            for (int j = 0; j < MB; ++j)
+#pragma unroll
+                                for (int i = 0; i < 16; ++i) if (c0 + j < cend) v[i] += pv[j][i];
+                        }
+                    } else {
+                        constexpr int MB = (TPB2_MERGE_B + 1) / 2;
+                        for (int c0 = b + 1; c0 < cend; c0 += MB) {
+                            float pv[MB][16], pu[MB][16];
+#pragma unroll
+                            for (int j = 0; j < MB; ++j) {
+                                const float* pp = P.part + static_cast<size_t>(c0 + j) * 2 * NMAX * 128;
+#pragma unroll
+                                for (int i = 0; i < 16; ++i) {
+                                    const bool ok = c0 + j < cend && tb + i < npad;
+                                    pv[j][i] = ok ? __ldcg(pp + (tb + i) * 128 + L) : 0.f;
+                                    pu[j][i] = ok ? __ldcg(pp + (NMAX + tb + i) * 128 + L) : 0.f;
+                                }
+                            }
+#pragma unroll
+                            for (int j = 0; j < MB; ++j)
+#pragma unroll
+                                for (int i = 0; i < 16; ++i) if (c0 + j < cend) { v[i] += pv[j][i]; vu[i] += pu[j][i]; }
                         }
                     }
                 }
@@ -1176,7 +1246,12 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                                 static_cast<uint32_t>(ex + 127) * 0x01010101u;
                     }
                     named_bar(3, 256);
-                    if (pub) { fence_acq_rel(); red_release_add(P.pan_cnt + par * MAXP + Ptot + p, 1u); }
+                    if (pub) {
+                        if (atom_add_acq_rel(P.pan_cnt + par * MAXP + Ptot + p, 1u) == NT1S - 1u) {   // the panel's last FC1 item: append it
+                            unsigned* rl = P.rdy + par * (MAXP + 32);
+                            st_release(rl + atomicAdd(rl + MAXP, 1u), static_cast<unsigned>(Ptot + p + 1));
+                        }
+                    }
                     continue;
                 }
                 // SwiGLU: the gate of an up lane's h column sits in lane ^ 8 of the same warp
@@ -1231,7 +1306,13 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                     }
                 }
                 named_bar(3, 256);
-                if (pub) { fence_acq_rel(); red_release_add(P.pan_cnt + par * MAXP + p, 1u); if (P.dbg) P.dbg[b * 32 + 4] = gtime(); }
+                if (pub) {
+                    if (atom_add_acq_rel(P.pan_cnt + par * MAXP + p, 1u) == NT1 - 1u) {   // the panel's last FC1 item: append it to the ready list
+                        unsigned* rl = P.rdy + par * (MAXP + 32);
+                        st_release(rl + atomicAdd(rl + MAXP, 1u), static_cast<unsigned>(p + 1));
+                    }
+                    if (P.dbg) P.dbg[b * 32 + 4] = gtime();
+                }
             }
             if (!fc1) {   // FC2 unit done (both groups): count its row tiles toward T1
                 named_bar(3, 256);
@@ -1327,7 +1408,7 @@ void set_pdl(int64_t v) { g_pdl = static_cast<int>(v); }
 void run(torch::Tensor maps, torch::Tensor w13_sf, torch::Tensor w2_sf, torch::Tensor lanes, torch::Tensor xb, c10::optional<torch::Tensor> glog,
          c10::optional<torch::Tensor> gbias, torch::Tensor ids, torch::Tensor rw, c10::optional<torch::Tensor> shared, double factor,
          torch::Tensor xq, torch::Tensor xs, torch::Tensor xg, torch::Tensor xgsf, c10::optional<torch::Tensor> dbg, torch::Tensor himg, torch::Tensor hsf, torch::Tensor part, torch::Tensor part_flags,
-         torch::Tensor xflag, torch::Tensor gcnt, torch::Tensor pan_cnt, torch::Tensor fc2_next, torch::Tensor rt_cnt, torch::Tensor work,
+         torch::Tensor xflag, torch::Tensor gcnt, torch::Tensor pan_cnt, torch::Tensor rdy, torch::Tensor fc2_next, torch::Tensor rt_cnt, torch::Tensor work,
          torch::Tensor outp, std::vector<int64_t> rs, std::vector<int64_t> ag, torch::Tensor out, int64_t my_rank, int64_t ndev, int64_t grid,
          c10::optional<torch::Tensor> smaps, c10::optional<torch::Tensor> sfa1s, c10::optional<torch::Tensor> sfa2s, torch::Tensor xgs,
          torch::Tensor xgsfs, torch::Tensor hsimg, torch::Tensor hssf, torch::Tensor shout) {
@@ -1350,7 +1431,7 @@ void run(torch::Tensor maps, torch::Tensor w13_sf, torch::Tensor w2_sf, torch::T
     P.dbg = dbg.has_value() ? reinterpret_cast<unsigned long long*>(dbg->data_ptr<int64_t>()) : nullptr; P.himg = himg.data_ptr<uint8_t>(); P.hsf = hsf.data_ptr<uint8_t>();
     P.part = part.data_ptr<float>(); P.part_flags = reinterpret_cast<unsigned*>(part_flags.data_ptr<int>());
     P.xflag = reinterpret_cast<unsigned*>(xflag.data_ptr<int>()); P.gcnt = reinterpret_cast<unsigned*>(gcnt.data_ptr<int>());
-    P.pan_cnt = reinterpret_cast<unsigned*>(pan_cnt.data_ptr<int>()); P.fc2_next = reinterpret_cast<unsigned*>(fc2_next.data_ptr<int>());
+    P.pan_cnt = reinterpret_cast<unsigned*>(pan_cnt.data_ptr<int>()); P.rdy = reinterpret_cast<unsigned*>(rdy.data_ptr<int>()); P.fc2_next = reinterpret_cast<unsigned*>(fc2_next.data_ptr<int>());
     P.rt_cnt = reinterpret_cast<unsigned*>(rt_cnt.data_ptr<int>()); P.work = reinterpret_cast<unsigned*>(work.data_ptr<int>());
     P.outp = reinterpret_cast<__nv_bfloat16*>(outp.data_ptr());
     for (int d = 0; d < NDEV; ++d) {

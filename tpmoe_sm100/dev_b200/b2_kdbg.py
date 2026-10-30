@@ -21,12 +21,13 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--ms', type=int, nargs='+', default=[1, 6, 16, 64])
     ap.add_argument('--grid', type=int, default=0)
+    ap.add_argument('--flags', default='', help='extra nvcc -D flags for the kernel build (own build dir)')
     ap.add_argument('--shared', action='store_true', help='fused shared expert (production DeepGEMM slice) vs the production shared output')
     ap.add_argument('--force', action='store_true', help='every token routed to experts 3 50 100 150 200 250 (wide panels), given top-k')
     args = ap.parse_args()
     dev = torch.device('cuda', 0)
     torch.backends.cuda.matmul.allow_tf32 = False
-    KE = tpb2.load_ext()
+    KE = tpb2.load_ext(tag=('_' + args.flags.replace('-D', '').replace('=', '').replace(' ', '_')) if args.flags else '', flags=tuple(args.flags.split()))
     st = tpb2.RankState(KE, dev, ndev=1, rank=0)
     if args.grid:
         st.grid = args.grid
