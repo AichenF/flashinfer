@@ -53,7 +53,8 @@ def main():
             v = rel[:, k][d[:, k] > 0]
             if len(v):
                 out.append(f'{nm} {float(v.median()):.1f}/{float(v.max()):.1f}')
-        sums = {16: 'mma_wait_full', 17: 'mma_wait_acce', 18: 'epi_wait_accf', 19: 'epi_busy', 20: 'prod_wait_empty', 21: 'prod_wait_hflag'}
+        sums = {16: 'mma_wait_full', 17: 'mma_wait_acce', 18: 'epi_wait_accf', 19: 'epi_busy', 20: 'prod_wait_empty', 21: 'prod_wait_hflag',
+                22: 'FC1_mma_wait_full', 23: 'FC1_mma_issue', 24: 'FC1_prod_wait_empty'}
         out.append('| FC2 sums us (median/max): ' + '  '.join(f'{nm} {float(d[:, k].median()) / 1e3:.1f}/{float(d[:, k].max()) / 1e3:.1f}' for k, nm in sums.items()))
         return '  '.join(out)
     for m in args.ms:

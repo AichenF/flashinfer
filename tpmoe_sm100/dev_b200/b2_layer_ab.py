@@ -54,7 +54,7 @@ def worker(rank, args):
     alt = torch.cuda.Stream()
     import tpb2
     from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-    KE = tpb2.load_ext()
+    KE = tpb2.load_ext(tag=('_' + args.flags.replace('-D', '').replace('=', '').replace(' ', '_')) if args.flags else '', flags=tuple(args.flags.split()))
     st = tpb2.RankState(KE, dev, ndev, rank)
     lib = CudaRTLibrary()
     keep, tables = [], []
@@ -244,6 +244,7 @@ if __name__ == '__main__':
     ap.add_argument('--copies', type=int, default=4)
     ap.add_argument('--rounds', type=int, default=5)
     ap.add_argument('--arms', nargs='*')
+    ap.add_argument('--flags', default='', help='extra nvcc -D flags for the fused kernel build (own build dir)')
     args = ap.parse_args()
     assert torch.cuda.device_count() >= args.ndev
     args.out.mkdir(parents=True, exist_ok=False)

@@ -26,7 +26,7 @@
 #include <cstring>
 
 #ifndef TPB2_NS
-#define TPB2_NS tpb2_v16
+#define TPB2_NS tpb2_v19
 #endif
 #ifndef TPB2_SMALLM
 #define TPB2_SMALLM 8   // fused gate: M <= this -> every CTA gates every token itself (no grid-wide routing barrier)
@@ -61,7 +61,10 @@ constexpr int NRT2 = DIM / 128;              // 32 FC2 row tiles
 constexpr int NCH2 = INTER / 128;            // 4 FC2 k-chunks
 constexpr int KC = 2;                        // k-chunks per pipeline stage
 constexpr int NSTG1 = NCH1 / KC, NSTG2 = NCH2 / KC;   // 16, 2 stages per FC1 item / FC2 unit
-constexpr int NS = 4;                        // ring stages
+#ifndef TPB2_NS_STAGES
+#define TPB2_NS_STAGES 4
+#endif
+constexpr int NS = TPB2_NS_STAGES;           // ring stages (5 x 16 KB of weights in flight per SM)
 constexpr int THREADS = 384;                 // 12 warps: producer, MMA, 2 x 4 epilogue, B, SF
 // FC2 unit = fc2g consecutive 128-row tiles of one panel (one ticket / ring entry); fc2g (1 | 2 | 4) chosen per launch from the panel count
 constexpr int NRT = DIM / 256;               // 16 T1 / all-reduce row tiles (256 rows)
@@ -78,15 +81,12 @@ constexpr int WR = 16;                       // work ring depth
 constexpr int A_BYTES = KC * 16384, B_BYTES = KC * NMAX * 128;
 constexpr int OFF_A = 0, OFF_B = OFF_A + NS * A_BYTES, OFF_SFA = OFF_B + NS * B_BYTES, OFF_SFB = OFF_SFA + NS * KC * 512;
 constexpr int OFF_TAB = OFF_SFB + NS * 512;
-constexpr int TAB_IDS = 0;                             // uint16 [MAXM][8] expert of (t, k), 0xFFFF = none
-constexpr int TAB_ENT = TAB_IDS + MAXM * 8 * 2;        // uint16 [MAXE] token of entry
-constexpr int TAB_KM = TAB_ENT + MAXE * 2;             // uint8 [MAXE] top-k slot mask of entry
-constexpr int TAB_PINF = TAB_KM + MAXE;                // uint32 [MAXP] panel: e | n << 8 | ebase << 14
+constexpr int TAB_ENT = 0;                             // uint16 [MAXE] entry: token | top-k slot mask << 9 (top-k <= 6)
+constexpr int TAB_PINF = TAB_ENT + MAXE * 2;           // uint32 [MAXP] panel: e | n << 8 | ebase << 14
 constexpr int TAB_RW = TAB_PINF + MAXP * 4;            // float [TPB2_SMALLM * 8] small fused gate: routing weights of (t, k)
 constexpr int TAB_AM = TAB_RW + TPB2_SMALLM * 8 * 4;   // float [4][NMAX] FC1 epilogue: per-warp amax exchange
 constexpr int TAB_MISC = TAB_AM + 4 * NMAX * 4;        // int [32]: 0 U, 1 entries, 2 panels, 8 T1 item, 9 epoch
-constexpr int TAB_TKE = TAB_MISC + 32 * 4;             // uint16 [MAXM][8] (t, k) -> panel << 5 | row (first slot of each (t, expert)), else 0xFFFF
-constexpr int TAB_PRDY = TAB_TKE + MAXM * 8 * 2;       // uint32 [MAXP / 32] FC2 B producer: panels whose h is known ready
+constexpr int TAB_PRDY = TAB_MISC + 32 * 4;            // uint32 [MAXP / 32] (unused since v15)
 constexpr int TAB_LANES = TAB_PRDY + MAXP / 8;          // uint8 [128] FC2 row of TMEM lane
 constexpr int TAB_STG = TAB_LANES + 128;               // bf16 [2][16][128] FC2 epilogue transpose staging
 constexpr int TAB_RING = TAB_STG + 2 * 16 * 128 * 2;   // int4 [WR] work ring
@@ -103,7 +103,9 @@ constexpr int PRO_OFFE = PRO_PRE + 16 * NEXP * 2;      // int [NEXP] entry offse
 constexpr int PRO_PIDE = PRO_OFFE + NEXP * 4;          // int [NEXP] first panel of expert
 constexpr int PRO_WS = PRO_PIDE + NEXP * 4;            // int [32] warp sums
 constexpr int PRO_GIDS = PRO_WS + 32 * 4;              // int [TPB2_SMALLM * 8] small fused gate: ids
-static_assert(PRO_GIDS + TPB2_SMALLM * 8 * 4 <= NS * A_BYTES, "prologue scratch");
+constexpr int PRO_IDS = PRO_GIDS + TPB2_SMALLM * 8 * 4; // uint16 [MAXM][8] expert of (t, k), 0xFFFF = none (tables only)
+constexpr int PRO_TKE = PRO_IDS + MAXM * 8 * 2;         // uint16 [MAXM][8] (t, k) -> panel << 5 | row (x scatter only)
+static_assert(PRO_TKE + MAXM * 8 * 2 <= NS * A_BYTES && PRO_IDS % 16 == 0, "prologue scratch");
 
 struct Params {
     CUtensorMap map1, map2;                  // w13 [E * 1024 rows][2048 B], w2 [E * 4096 rows][256 B]: 16U4_ALIGN16B {128, rows, chunks}
@@ -426,10 +428,10 @@ struct Tabs {
 };
 __device__ __forceinline__ Tabs tabs(uint8_t* smem) {
     uint8_t* t = smem + OFF_TAB;
-    return Tabs{reinterpret_cast<uint16_t*>(t + TAB_IDS), reinterpret_cast<uint16_t*>(t + TAB_ENT), t + TAB_KM,
+    return Tabs{reinterpret_cast<uint16_t*>(smem + PRO_IDS), reinterpret_cast<uint16_t*>(t + TAB_ENT), nullptr,
                 reinterpret_cast<uint32_t*>(t + TAB_PINF), reinterpret_cast<float*>(t + TAB_RW), reinterpret_cast<float*>(t + TAB_AM),
                 reinterpret_cast<int*>(t + TAB_MISC), t + TAB_LANES, reinterpret_cast<int4*>(t + TAB_RING),
-                reinterpret_cast<uint16_t*>(t + TAB_TKE), reinterpret_cast<uint32_t*>(t + TAB_PRDY), reinterpret_cast<__nv_bfloat16*>(t + TAB_STG)};
+                reinterpret_cast<uint16_t*>(smem + PRO_TKE), reinterpret_cast<uint32_t*>(t + TAB_PRDY), reinterpret_cast<__nv_bfloat16*>(t + TAB_STG)};
 }
 // Every CTA, all THREADS: union = present experts in ascending id; entries of an expert = its tokens in ascending order (a token listing
 // the same expert in several slots is ONE entry, km = its slots); panels of <= NMAX entries.  ids from smem (gids, small fused gate) or
@@ -500,8 +502,7 @@ __device__ void build_tables(const Params& P, uint8_t* smem, const Tabs& T, cons
         if (km & ((1u << k) - 1u)) continue;
         const int w = t >> 5;
         const int idx = offe[e] + pre[w * NEXP + e] + __popc(bits[w * NEXP + e] & ((1u << (t & 31)) - 1u));
-        T.ent[idx] = static_cast<uint16_t>(t);
-        T.km[idx] = static_cast<uint8_t>(km);
+        T.ent[idx] = static_cast<uint16_t>(t | (km << 9));
         const int j = idx - offe[e];
         T.tke[t * 8 + k] = static_cast<uint16_t>(((pide[e] + j / NMAX) << 5) | (j % NMAX));
     }
@@ -530,15 +531,13 @@ constexpr size_t AG_PAR = static_cast<size_t>(NRT) * MAXM * NMSG;
 // T1 of one (row tile, token) by one warp: lane l owns values rtile * 256 + 8 l .. + 7
 __device__ __forceinline__ void t1_pair(const Params& P, const Tabs& T, bool small_rw, int rtile, int t, unsigned epoch, __nv_bfloat16* stg, int lane) {
     const int topk = P.topk;
-    const uint4 idrow = *reinterpret_cast<const uint4*>(T.ids + t * 8);
-    const uint32_t idw[4] = {idrow.x, idrow.y, idrow.z, idrow.w};
     const int c0 = rtile * 256 + 8 * lane;
     uint4 v[TOPK_MAX];
     float wk[TOPK_MAX];
     unsigned on = 0u;
 #pragma unroll
     for (int k = 0; k < TOPK_MAX; ++k) {
-        if (k < topk && ((idw[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu) != 0xFFFFu) {
+        if (k < topk && static_cast<unsigned>(__ldcg(P.ids + t * topk + k)) < static_cast<unsigned>(NEXP)) {   // (ids: P.ids, CTA 0's in the small gate)
             on |= 1u << k;
             wk[k] = bf16r(small_rw ? T.srw[t * topk + k] : __ldcg(P.rw + t * topk + k));   // (PackTopkIds: bf16 routing weights)
             v[k] = __ldcg(reinterpret_cast<const uint4*>(P.outp + (static_cast<size_t>(t) * TOPK_MAX + k) * DIM + c0));
@@ -788,11 +787,12 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 ++w;
             };
             bool in_fc2 = false;
+            unsigned long long pw1 = 0, pw2 = 0;   // (dbg) producer waits for free stages, FC1 / FC2
             auto stage = [&](const CUtensorMap* map, int row, int ch0, const uint8_t* sfa, uint32_t atx) {   // KC chunks of one 128-row tile
                 const int st = fills % NS;
                 const unsigned long long tw = P.dbg ? gtime() : 0ull;
                 if (fills >= NS) mbar_wait(bar(B_EMPTY + st), ((fills / NS) - 1) & 1);
-                if (P.dbg && in_fc2) P.dbg[b * 32 + 20] += gtime() - tw;
+                if (P.dbg) { if (in_fc2) pw2 += gtime() - tw; else pw1 += gtime() - tw; }
                 mbar_expect_tx(bar(B_FULL + st), atx + KC * 512);
                 tma3d(sb + OFF_A + st * A_BYTES, map, 0, row, ch0, bar(B_FULL + st));
                 bulk_g2s(sb + OFF_SFA + st * KC * 512, sfa, KC * 512, bar(B_FULL + st));
@@ -885,6 +885,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 }
             }
             push(make_int4(-1, 0, 0, 0));
+            if (P.dbg) { P.dbg[b * 32 + 24] = pw1; P.dbg[b * 32 + 20] = pw2; }
         }
         __syncwarp();
     } else if (warp == 7) {
@@ -1008,15 +1009,24 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
         __syncwarp();
     } else if (warp == 1) {
         // ======================================================== MMA issuer (converged warp, one elected lane)
-        int fills = 0, w = 0, uses[ACC] = {0, 0, 0, 0}, ab = 0;
+        // tcgen05.mma operands must be warp-uniform (uniform registers): TMEM base, descriptor fields via shuffles (else every MMA
+        // issue gets an R2UR loop -- measured ~48 vs ~25 ns per MMA)
+        const uint32_t tmem_u = warp_uniform(tmem);
+        int fills = 0, w = 0, kacc = 0;   // accumulators issued so far: buffer kacc % ACC, use kacc / ACC
+        unsigned long long acc_w1 = 0, acc_w2 = 0, acc_i1 = 0;   // (dbg) FC1 / FC2 data waits, FC1 issue time
         for (;;) {
             const int slot = w % WR;
             mbar_wait(bar(B_WF + slot), (w / WR) & 1);
-            const int4 d = ring[slot];
+            int4 d = ring[slot];
+            d.x = static_cast<int>(warp_uniform(static_cast<uint32_t>(d.x))); d.y = static_cast<int>(warp_uniform(static_cast<uint32_t>(d.y)));
+            d.z = static_cast<int>(warp_uniform(static_cast<uint32_t>(d.z))); d.w = static_cast<int>(warp_uniform(static_cast<uint32_t>(d.w)));
             __syncwarp();
             if (lane == 0) mbar_arrive(bar(B_WE + slot));
             ++w;
-            if (d.x < 0) break;
+            if (d.x < 0) {
+                if (P.dbg && lane == 0) { P.dbg[b * 32 + 22] = acc_w1; P.dbg[b * 32 + 16] = acc_w2; P.dbg[b * 32 + 23] = acc_i1; }
+                break;
+            }
             const int n = panel_n(d);
             const uint32_t npad = warp_uniform(static_cast<uint32_t>((n + 7) & ~7));
             const bool shk = d.x >= 3;   // shared expert: e4m3 A
@@ -1024,20 +1034,20 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
             const bool fc1 = (d.x & 1) != 0;
             const int nacc = fc1 ? 1 : fc2g, nst = fc1 ? d.w - d.z : NSTG2;
             for (int a = 0; a < nacc; ++a) {   // FC1: one accumulator; FC2: one per row tile of the group
-                const unsigned long long tw1 = P.dbg ? gtime() : 0ull;
-                if (uses[ab] > 0) mbar_wait(bar(B_ACCE + ab), (uses[ab] - 1) & 1);
-                if (P.dbg && lane == 0 && d.x == 2) P.dbg[b * 32 + 17] += gtime() - tw1;
+                const int ab = kacc % ACC;
+                if (kacc >= ACC) mbar_wait(bar(B_ACCE + ab), ((kacc / ACC) - 1) & 1);
                 tc_fence_after();
-                const uint32_t dacc = tmem + ab * ACC_COLS;
+                const uint32_t dacc = tmem_u + ab * ACC_COLS;
                 for (int j = 0; j < nst; ++j) {
                     const int st = fills % NS;
                     const unsigned long long tw0 = P.dbg ? gtime() : 0ull;
                     mbar_wait(bar(B_FULL + st), (fills / NS) & 1);
                     mbar_wait(bar(B_SFR + st), (fills / NS) & 1);
-                    if (P.dbg && lane == 0 && d.x == 2) P.dbg[b * 32 + 16] += gtime() - tw0;
+                    const unsigned long long tw1 = P.dbg ? gtime() : 0ull;
+                    if (fc1) acc_w1 += tw1 - tw0; else acc_w2 += tw1 - tw0;
                     if (P.dbg && lane == 0) { if (fills == 0) P.dbg[b * 32 + 9] = gtime(); if (d.x == 1) P.dbg[b * 32 + 10] = gtime(); }
                     tc_fence_after();
-                    const uint32_t tsf = tmem + TSF0 + st * TSF_STRIDE;
+                    const uint32_t tsf = tmem_u + TSF0 + st * TSF_STRIDE;
                     const uint64_t ad0 = desc_sw128(sb + OFF_A + st * A_BYTES), bd0 = desc_sw128(sb + OFF_B + st * B_BYTES);
                     if (elect_one()) {
                         if (d.x == 3) {   // shared FC1: chunk s of the gate tile (-> columns 0..) and of the up tile (-> columns 32..), one B chunk
@@ -1060,12 +1070,12 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                         tc_commit(bar(B_EMPTY + st));
                     }
                     __syncwarp();
+                    if (P.dbg && fc1) acc_i1 += gtime() - tw1;
                     ++fills;
                 }
                 if (elect_one()) tc_commit(bar(B_ACCF + ab));
                 __syncwarp();
-                ++uses[ab];
-                ab = (ab + 1) % ACC;
+                ++kacc;
             }
         }
     } else {
@@ -1077,7 +1087,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
         const int frow = T.lanes[L];
 
         __nv_bfloat16* stg = T.stg + g * 16 * 128;   // FC2 transpose staging [16 tokens][128 rows]
-        int w = 0, uses[ACC] = {0, 0, 0, 0}, ab = 0;
+        int w = 0, kacc = 0;
         unsigned rt_n[NRT];   // (pub) FC2 row tiles stored per 256-row T1 tile, published once at the end
 #pragma unroll
         for (int i = 0; i < NRT; ++i) rt_n[i] = 0u;
@@ -1106,8 +1116,9 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
             const bool fc1 = (d.x & 1) != 0;
             const int nacc = fc1 ? 1 : fc2g;
             for (int a = 0; a < nacc; ++a) {
+                const int ab = kacc % ACC;
                 const unsigned long long te0 = P.dbg ? gtime() : 0ull;
-                mbar_wait(bar(B_ACCF + ab), uses[ab] & 1);
+                mbar_wait(bar(B_ACCF + ab), (kacc / ACC) & 1);
                 const unsigned long long te1 = P.dbg ? gtime() : 0ull;
                 if (P.dbg && pub && !fc1) P.dbg[b * 32 + 18] += te1 - te0;
                 if (P.dbg && pub && d.x == 1 && first_fc1) { P.dbg[b * 32 + 11] = gtime(); first_fc1 = false; }
@@ -1119,8 +1130,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 tc_fence_before();
                 __syncwarp();
                 if (lane == 0) mbar_arrive(bar(B_ACCE + ab));
-                ++uses[ab];
-                ab = (ab + 1) % ACC;
+                ++kacc;
                 if (!fc1) {
                     // ---- FC2 row tile r: transpose through smem, 16-B rows of bf16 per (token, slot) / shared: per token of shout
                     const int r = (d.y % nrg) * fc2g + a;
@@ -1136,8 +1146,9 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                             *reinterpret_cast<uint4*>(P.shout + static_cast<size_t>(NMAX * p + tb + i) * DIM + r * 128 + 8 * c) = val;
                             continue;
                         }
-                        const int t = T.ent[eb + tb + i];
-                        unsigned km = T.km[eb + tb + i];
+                        const unsigned ev = T.ent[eb + tb + i];
+                        const int t = static_cast<int>(ev & 511u);
+                        unsigned km = ev >> 9;
                         while (km) {
                             const int k = __ffs(km) - 1;
                             km &= km - 1;
