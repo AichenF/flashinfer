@@ -45,11 +45,11 @@ scalings exist in the checkpoint (attn_res_block_size 12) and are outside this b
 - Removed from the tp4moe2 source: the fused sqrt-softplus top-6 router and router GEMM (K3 routes with a sigmoid gate, computed outside),
   the fused FP8 shared expert (K3's is full-width 7168 and belongs to the second reduce stage), the RS + AG tail (14 row tiles do not
   split over 8 ranks), the CTA-local dense quantization (hard-coded to 4096-wide rows) and the timing-diagnostic knobs. Dense mode
-  (`TP2_DENSE_MAXM`, default off) is kept but untuned for 896 experts.
+  (`TP2_DENSE_MAXM`) is kept and is the default at M <= 8 (see the small-M section).
 - ptxas: 96 registers (640-thread launch bound), 80 B stack frame (the 16-slot T1 combine spills; tp4moe2 had none).
 
-**Shared with `serving_tp4moe2_v26/`, and why the kernel is a separate file.** The k-loop pipeline headers (`kpipe.cuh`, `chain4.cuh`)
-are the tp4moe2 files, included from `../serving_tp4moe2_v26` (`tp8moe_host.py` adds the `-I`). `tp8moe.cu` is `tp4moe2_ns.cu`
+**Shared with `serving_tp4moe2_v26/`, and why the kernel is a separate file.** The k-loop pipeline header (`kpipe.cuh`)
+is the tp4moe2 file, included from `../serving_tp4moe2_v26` (`tp8moe_host.py` adds the `-I`). `tp8moe.cu` is `tp4moe2_ns.cu`
 generalized (`ITEMS` / `NKT1` / `NRT` / `NEXP` / `TOPK_MAX` / `NDEV` instead of the hard-coded 4 / 32 / 16 / 256 / 8 / 4, wider bit
 fields: expert 10 bits, pid at bit 20, 16-bit slot masks) plus the K3-only pieces above. It is not folded into the tp4moe2 sources
 because that package is frozen (`sources.json` pins every file by SHA-256) and the wider bit fields change the validated binary. The
@@ -113,12 +113,12 @@ What the M = 1 timeline looked like (`-DTP2_STAMPS -DTP2_LIGHT_STAMPS`, globalti
 (pre-cleanup kernel; this kernel in brackets): tables 10.0 -> 3.7 (2.5), consumers at FC1 13.5 -> 4.3 (2.8), first FC1 stage consumed ~14.5 -> 5.9 (4.4),
 FC1 done 25.3 -> 16.7 (15.1; max 27.6 -> 18.3), FC2 done 35.0 -> 25.7 (23.9), exit 36.3 -> 26.9 (25.2; max 39.2 -> 29.2 (27.5)).
 
-- **Block-wide small tables** (`build_tables_small3`, `TP2_SMALL_TABLES_BW`). The one-warp bitmap builder scanned 896 / 32 = 28 experts
+- **Block-wide small tables** (`build_tables_small3`). The one-warp bitmap builder it replaced scanned 896 / 32 = 28 experts
   per lane in unrolled loops: ~12k cycles at M = 1, mostly cold i-cache misses on ~15 KB of straight-line code (6.4 us of the 10 us
   prologue). Now warps 0..7 build the same tables: each thread owns experts tid + 256 r (4 rounds), the 4 rounds' warp scans run together
   with (present, count, padded rows) packed in one word, the (round, warp) sums are prefix-summed by one more warp scan (no serial loop,
-  one barrier), entries and stream-K bounds one per thread. 3.1 us for the whole prologue; `-DTP2_TABLES_CHECK=1` builds both and counts
-  differing table words into `work[3]`.
+  one barrier), entries and stream-K bounds one per thread. 3.1 us for the whole prologue. (A `TP2_TABLES_CHECK` build compared the
+  two builders' tables word for word; the one-warp builders and the check have since been removed.)
 - **Dense mode at M <= 8** (host default `TP2_DENSE_MAXM` 8, env override). Every panel's FC1 B operand is x rows 0..7 by TMA straight from
   xq (OOB rows zero-filled) instead of the grid-wide gather into xg + `xg_cnt` round trips; at M <= 8 every panel is N8 either way, so
   the MMA work is identical. The 3.3 us gather chain between the tables and the first FC1 stage is gone (-2.5 us at M = 1).
@@ -127,12 +127,14 @@ FC1 done 25.3 -> 16.7 (15.1; max 27.6 -> 18.3), FC2 done 35.0 -> 25.7 (23.9), ex
   counter is loaded once at kernel start into smem (pinned load, latency under the table build) instead of by every role after the sync;
   the 4 weight tensor maps are prefetched at kernel start.
 
-Measured and rejected (numbers at M = 1 unless noted): per-row x TMA (`TP2_ROWX` 2: 39.2 vs 38.9); two panel groups (`TP2_GROUPS_MINM=1`:
-38.5); CTA-local quantization (`TP2_LQUANT_MAXM` 2 / 8: +0.3 / +0.4 -- the token flag is hidden under the tables); PDL launch (no
-`launch_dependents` in the kernel: 0); dense epilogue credit in the stream-K cost (`TP2_EPI_SCALE_DENSE` 100 / 200: -0.2 / 0.0, although
-owner CTAs finish FC1 1.5-2 us after non-owners); an early pass issuing 1-7 stages of weight TMAs from the producer warp during the table
-build (`TP2_EARLY_TMA`, it sorts the <= 32 ids itself: +0.8..+1.2 us -- the burst is HBM-bound either way and the queued TMA requests held
-up the producer's `setmaxnreg` after the sync); grabbing the next T1 item ahead (the first CTAs took two items each: +2 us); two or four
+Measured and rejected (numbers at M = 1 unless noted; the compile-time knobs named here were removed from the kernel afterwards, only the
+runtime env `TP2_GROUPS_MINM` / `TP2_DENSE_MAXM` overrides remain): per-row x TMA (was `TP2_ROWX` 2: 39.2 vs 38.9); two panel groups
+(`TP2_GROUPS_MINM=1`: 38.5); CTA-local quantization (was `TP2_LQUANT_MAXM` 2 / 8: +0.3 / +0.4 -- the token flag is hidden under the
+tables); PDL launch (was env `TP2_PDL`; no `launch_dependents` in the kernel: 0); dense epilogue credit in the stream-K cost (was `TP2_EPI_SCALE_DENSE` 100 /
+200: -0.2 / 0.0, although owner CTAs finish FC1 1.5-2 us after non-owners); an early pass issuing 1-7 stages of weight TMAs from the
+producer warp during the table build (was `TP2_EARLY_TMA`, it sorts the <= 32 ids itself: +0.8..+1.2 us -- the burst is HBM-bound either
+way and the queued TMA requests held up the producer's `setmaxnreg` after the sync); grabbing the next T1 item ahead (the first CTAs took
+two items each: +2 us); two or four
 lanes per T1 message (0 at M = 1, +0.6 / +3 us at M = 4 / 8); an out-of-line T1 message warmed up by warp 18 during FC2 (+6 us: the call
 wrecks the register allocation). What remains at M = 1: 1.3 us for the first global load (ids) and ~0.5 us cold-code costs at each phase
 start, FC1 10.8 us (17 k-tiles at 0.65 us: dequant-ALU / handshake bound), the FC1 -> FC2 chain 3.2 us (owner epilogue 0.4, pan_cnt
@@ -152,15 +154,18 @@ Kernel time, 896 experts, graph of 32 back-to-back calls, us per call (TP8: wors
 
 | M | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
-| H200 single GPU, ndev 1 (no reduce) | 41.0 | 49.9 | 62.1 | 82.2 | 99.3 | 120.2 |
-| **H200 TP8, incl. 8-way one-shot LL reduce** | **39.5** | **47.4** | **60.4** | **79.2** | **98.7** | **126.0** |
+| H200 v0 single GPU, ndev 1 (no reduce) | 41.0 | 49.9 | 62.1 | 82.2 | 99.3 | 120.2 |
+| H200 v0 TP8, incl. 8-way one-shot LL reduce | 39.5 | 47.4 | 60.4 | 79.2 | 98.7 | 126.0 |
 | H200 single GPU after the cleanup + small-M work (601bb98fd, viking-prod-260, job 5531020) | 25.4 | 33.1 | 44.1 | 61.6 | 86.4 | 106.7 |
+| **H200 TP8 after 601bb98fd, incl. 8-way reduce (viking-prod-649, job 5530640; same job ndev 1: 25.6 / 33.2 / 44.4 / 62.0 / 87.3 / 107.5)** | **28.8** | **36.5** | **48.2** | **67.7** | **93.5** | **119.1** |
 | H20 TP8 (78 SMs) | 41.7 | 52.1 | 70.4 | 100.5 | 127.2 | 157.3 |
 | unique experts | 16 | 28 | 51 | 88 | 121 | 153 |
 | SOL at 4.0 TB/s (2.2 MB per unique expert per rank) | 9 | 15 | 28 | 48 | 67 | 84 |
 
-The TP8 run is not slower than the single-GPU run: the LL reduce is hidden behind the panel tail, and the single-GPU numbers came from
-a node with other users' jobs. M = 1 is the same ~40 us as on H20: the small-M path is latency-bound (16 narrow panels of 3 x 28
+After 601bb98fd the TP8 kernel is 28.8 us at M = 1 and 119.1 at M = 32; measured in the same job, the 8-way reduce now costs 3-4 us at
+M <= 4 and 6-12 us at M = 16..32 over the single-GPU run (the shorter tail no longer hides it). On v0 the TP8 run was not slower than the
+single-GPU run: the LL reduce hid behind the panel tail, and the single-GPU numbers came from a node with other users' jobs. v0 M = 1
+was the same ~40 us as on H20: the small-M path is latency-bound (16 narrow panels of 3 x 28
 k-tiles, 16-slot combine, one-shot barrier), not bandwidth-bound, so the 132-SM / 4.8 TB/s H200 only helps from M >= 4 (-14 % at
 M = 4, -20 % at M = 32 vs H20). Graph medians sit 8-11 us above the minima with 32 calls per graph (30-70 us above with 4 calls):
 that is the launch skew of 8 uncoupled processes on a shared node, not kernel variance (the layer graphs below, which contain NCCL
@@ -172,7 +177,8 @@ Whole layer (`MoELayerTP8`), one CUDA graph of 32 layer calls, worst rank, us pe
 |---|---|---|---|
 | H200 layer graph (min / median) | 213.8 / 214.3 | 279.8 / 280.2 | 371.3 / 372.0 |
 | H200 layer graph, sglang image, NCCL 2.30.7 NVLS off (job 5509039, viking-prod-214) | 227.6 | 319.6 | 405.6 |
-| of which the kernel | 40 | 79 | 126 |
+| H200 layer graph, sglang image, after 601bb98fd (job 5530640, viking-prod-649; eager 473 / 524 / 532) | 206.0 | 297.4 | 395.9 |
+| of which the kernel (v0 / after 601bb98fd) | 40 / 29 | 79 / 68 | 126 / 119 |
 | H200 layer eager | 802 | 471 | 479 |
 | H20 layer graph | 198 | 314 | 453 |
 
@@ -197,17 +203,18 @@ Kernel (routed experts + 8-way reduce), 896 experts:
 | unique experts / bytes per rank, MB | 16 / 35 | 28 / 61 | 51 / 112 | 88 / 193 | 121 / 265 | 153 / 336 |
 | SOL at 4.8 TB/s peak, us | 7.3 | 12.8 | 23.3 | 40.2 | 55.3 | 69.9 |
 | SOL at 4.0 TB/s achievable, us | 8.8 | 15.4 | 28.0 | 48.3 | 66.4 | 83.9 |
-| measured H200 TP8, us | 39.5 | 47.4 | 60.4 | 79.2 | 98.7 | 126.0 |
-| achieved HBM bandwidth, TB/s | 0.89 | 1.30 | 1.85 | 2.44 | 2.69 | 2.66 |
-| **% of SOL (4.0 TB/s)** | **22** | **32** | **46** | **61** | **67** | **67** |
-| % of peak 4.8 TB/s | 19 | 27 | 39 | 51 | 56 | 55 |
+| measured H200 TP8, us (601bb98fd, job 5530640) | 28.8 | 36.5 | 48.2 | 67.7 | 93.5 | 119.1 |
+| achieved HBM bandwidth, TB/s | 1.22 | 1.68 | 2.32 | 2.85 | 2.83 | 2.81 |
+| **% of SOL (4.0 TB/s)** | **31** | **42** | **58** | **71** | **71** | **70** |
+| % of peak 4.8 TB/s | 25 | 35 | 48 | 59 | 59 | 59 |
+| v0 H200 TP8, us / % of SOL | 39.5 / 22 | 47.4 / 32 | 60.4 / 46 | 79.2 / 61 | 98.7 / 67 | 126.0 / 67 |
 | H20 TP8, % of its 4.0 TB/s SOL | 21 | 29 | 40 | 48 | 52 | 53 |
 
-M = 1 is 22 % of SOL and the gap is latency, not bandwidth: 16 panels x 3 items x 28 k-tiles is one wave on 132 SMs with a dependent
-FC1 -> FC2 chain, a 16-slot combine and a one-shot barrier, which is why M = 1 costs the same ~40 us on H20 and H200. From M >= 8 the
-kernel sits at 61-67 % of achievable bandwidth (2.4-2.7 TB/s), a +8-14 point gain over H20 and in line with the DeepSeek tp4moe2 kernel
-(23-54 % on H20). The remaining third at large M is the FC2 k-tile serialization and the tail (combine + reduce) that no longer hides
-behind loads.
+M = 1 is 31 % of SOL and the gap is latency, not bandwidth: 16 panels x 3 items x 28 k-tiles is one wave on 132 SMs with a dependent
+FC1 -> FC2 chain, a 16-slot combine and a one-shot barrier (28.8 us on H200 vs 29.5 on H20 after 601bb98fd; v0 was ~40 us on both).
+From M >= 8 the kernel sits at 70-71 % of achievable bandwidth (2.8 TB/s), up from 61-67 % on v0 and well above the DeepSeek tp4moe2
+kernel (23-54 % on H20). The remaining 30 % at large M is the FC2 k-tile serialization and the tail (combine + reduce) that no longer
+hides behind loads.
 
 Whole layer, counting every weight the block must read per rank per layer with everything sharded 8 ways (router 1.6 MB, W_down 6.4,
 W_up 6.4, shared expert 33.0, total 47.5 MB dense + the routed experts above; the current glue reads 71.6 MB of dense weights because
@@ -249,6 +256,7 @@ Routed experts only, one GPU (the baselines have no cross-rank reduce; our TP8 f
 |---|---|---|---|---|---|---|
 | unique experts / bytes per rank, MB | 16 / 35 | 28 / 61 | 51 / 112 | 88 / 193 | 121 / 265 | 153 / 336 |
 | **ours, single GPU (ndev 1)** | **25.4** | **33.1** | **44.1** | **61.6** | **86.4** | **106.7** |
+| **ours, TP8 incl. 8-way reduce (job 5530640)** | **28.8** | **36.5** | **48.2** | **67.7** | **93.5** | **119.1** |
 | ours v0 (before the cleanup + small-M work), single GPU | 36.7 | 44.3 | 56.7 | 74.5 | 92.5 | 113.6 |
 | ours v0, TP8 incl. 8-way reduce | 39.6 | 47.3 | 60.4 | 78.9 | 98.4 | 125.8 |
 | Marlin MXFP4 W4A16 (viking-prod-260 re-run: 33.3 / 44.5 / 70.6 / 100.9 / 134.2 / 168.2) | 33.4 | 44.5 | 70.3 | 101.1 | 133.9 | 168.2 |
@@ -257,6 +265,7 @@ Routed experts only, one GPU (the baselines have no cross-rank reduce; our TP8 f
 | NCCL all-reduce [M, 3584] bf16 x 8 (what a baseline adds under TP8) | 21.9 | 22.3 | 23.4 | 27.2 | 26.7 | 21.8 |
 | ours ndev 1 vs Marlin | 1.31x | 1.34x | 1.60x | 1.64x | 1.55x | 1.58x |
 | ours ndev 1 vs Humming W4A8 | 3.08x | 2.89x | 2.84x | 2.81x | 2.50x | 2.43x |
+| ours TP8 vs Marlin + NCCL | 1.92x | 1.83x | 1.94x | 1.90x | 1.72x | 1.60x |
 | ours v0 TP8 vs Marlin + NCCL | 1.40x | 1.41x | 1.55x | 1.63x | 1.63x | 1.51x |
 | achieved HBM TB/s: ours ndev 1 / Marlin / Humming | 1.38 / 1.05 / 0.45 | 1.84 / 1.38 / 0.64 | 2.54 / 1.59 / 0.89 | 3.13 / 1.91 / 1.11 | 3.07 / 1.98 / 1.23 | 3.15 / 2.00 / 1.29 |
 | % of SOL at 4.0 TB/s: ours ndev 1 / Marlin / Humming | 34 / 26 / 11 | 46 / 35 / 16 | 64 / 40 / 22 | 78 / 48 / 28 | 77 / 50 / 31 | 79 / 50 / 32 |
@@ -265,7 +274,9 @@ Reading: the kernel is the fastest of the set at every M (1.31-1.64x over Marlin
 W4A16 path) and reaches 64-79 % of achievable HBM bandwidth from M = 4 where Marlin plateaus at 50 % and Humming at ~30 %. The v0 rows
 show the state before the cleanup (72e08e484) and the small-M work (601bb98fd): at M = 1 v0 was 3.3 us behind Marlin; the block-wide
 table build, the dense x path at M <= 8 and the tail changes took 11.3 us off M = 1 and 11-13 us off M = 2..8 on H200, so the M = 1
-latency floor is now 25.4 us against Marlin's 33.4. The NCCL figure is torch.distributed NCCL 2.30.7 with NVLS disabled
+latency floor is now 25.4 us against Marlin's 33.4. Under TP8, where a baseline needs a separate all-reduce, the kernel with its
+8-way reduce included is 1.6-1.9x Marlin + NCCL (job 5530640 on viking-prod-649 re-measured Marlin at 33.9 / 44.5 / 70.6 / 100.3 /
+133.9 / 168.7, within 0.6 us of the table). The NCCL figure is torch.distributed NCCL 2.30.7 with NVLS disabled
 (`NCCL_NVLS_ENABLE=0`: the multicast bind fails in this container); SGLang's custom one-shot all-reduce would be a few us lower, which
 does not change the ranking.
 
@@ -321,7 +332,7 @@ $PY pp2.py --layers 2 --ms 1 8 --nexp 32 --colocated --time  # TP8 x PP2 rehears
 
 1. Tail fusion: RMSNorm + W_up K-slice + shared-expert shard + 7168-wide reduce inside the kernel (second LL stage) instead of torch + NCCL.
 2. Sharded router + W_down GEMM with an NVLink all-gather of z (today: torch GEMM + NCCL all-gather).
-3. Small-M latency, next round: the FC1 -> FC2 handoff chain (~3 us at M = 1), the FC1 k-tile handshake rate, dense mode for M <= 32 (then the compact gather path can go); fold the default-on TP2_* knobs into the single path and drop the off-by-default A/B knobs.
+3. Small-M latency, next round: the FC1 -> FC2 handoff chain (~3 us at M = 1), the FC1 k-tile handshake rate, dense mode for M <= 32 (then the compact gather path can go). (The default-on TP2_* knobs are folded into the single path and the off-by-default A/B knobs are gone; what remains are `TP2_STAMPS` / `TP2_LIGHT_STAMPS` instrumentation and the tuned constants `TP2_COST` / `TP2_EPI_COST` / `TP2_EPI_SCALE` / `TP2_DENSE_MAXM` / `TP2_FC2_L2PF` / `TP2_EARLY_XQ_MAXM` / `TP2_PROD_REGS` / `TP2_CONS_REGS` / `TP2_W_L2PROMO`.)
 4. Activation quantization: K3 was trained with MXFP8 (per-32-group) activations; the kernel uses per-token FP8. Evaluate on real weights.
 5. RS + AG tail for M > 32 / larger prefill-ish batches; M * topk > 512 tables.
 6. Engine hook (SGLang / vLLM K3 model) with 46 layers per stage; CUDA-graph the whole stage incl. the hop.
