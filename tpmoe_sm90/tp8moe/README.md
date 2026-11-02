@@ -152,15 +152,18 @@ Kernel time, 896 experts, graph of 32 back-to-back calls, us per call (TP8: wors
 
 | M | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
-| H200 single GPU, ndev 1 (no reduce) | 41.0 | 49.9 | 62.1 | 82.2 | 99.3 | 120.2 |
-| **H200 TP8, incl. 8-way one-shot LL reduce** | **39.5** | **47.4** | **60.4** | **79.2** | **98.7** | **126.0** |
+| H200 v0 single GPU, ndev 1 (no reduce) | 41.0 | 49.9 | 62.1 | 82.2 | 99.3 | 120.2 |
+| H200 v0 TP8, incl. 8-way one-shot LL reduce | 39.5 | 47.4 | 60.4 | 79.2 | 98.7 | 126.0 |
 | H200 single GPU after the cleanup + small-M work (601bb98fd, viking-prod-260, job 5531020) | 25.4 | 33.1 | 44.1 | 61.6 | 86.4 | 106.7 |
+| **H200 TP8 after 601bb98fd, incl. 8-way reduce (viking-prod-649, job 5530640; same job ndev 1: 25.6 / 33.2 / 44.4 / 62.0 / 87.3 / 107.5)** | **28.8** | **36.5** | **48.2** | **67.7** | **93.5** | **119.1** |
 | H20 TP8 (78 SMs) | 41.7 | 52.1 | 70.4 | 100.5 | 127.2 | 157.3 |
 | unique experts | 16 | 28 | 51 | 88 | 121 | 153 |
 | SOL at 4.0 TB/s (2.2 MB per unique expert per rank) | 9 | 15 | 28 | 48 | 67 | 84 |
 
-The TP8 run is not slower than the single-GPU run: the LL reduce is hidden behind the panel tail, and the single-GPU numbers came from
-a node with other users' jobs. M = 1 is the same ~40 us as on H20: the small-M path is latency-bound (16 narrow panels of 3 x 28
+After 601bb98fd the TP8 kernel is 28.8 us at M = 1 and 119.1 at M = 32; measured in the same job, the 8-way reduce now costs 3-4 us at
+M <= 4 and 6-12 us at M = 16..32 over the single-GPU run (the shorter tail no longer hides it). On v0 the TP8 run was not slower than the
+single-GPU run: the LL reduce hid behind the panel tail, and the single-GPU numbers came from a node with other users' jobs. v0 M = 1
+was the same ~40 us as on H20: the small-M path is latency-bound (16 narrow panels of 3 x 28
 k-tiles, 16-slot combine, one-shot barrier), not bandwidth-bound, so the 132-SM / 4.8 TB/s H200 only helps from M >= 4 (-14 % at
 M = 4, -20 % at M = 32 vs H20). Graph medians sit 8-11 us above the minima with 32 calls per graph (30-70 us above with 4 calls):
 that is the launch skew of 8 uncoupled processes on a shared node, not kernel variance (the layer graphs below, which contain NCCL
@@ -172,7 +175,8 @@ Whole layer (`MoELayerTP8`), one CUDA graph of 32 layer calls, worst rank, us pe
 |---|---|---|---|
 | H200 layer graph (min / median) | 213.8 / 214.3 | 279.8 / 280.2 | 371.3 / 372.0 |
 | H200 layer graph, sglang image, NCCL 2.30.7 NVLS off (job 5509039, viking-prod-214) | 227.6 | 319.6 | 405.6 |
-| of which the kernel | 40 | 79 | 126 |
+| H200 layer graph, sglang image, after 601bb98fd (job 5530640, viking-prod-649; eager 473 / 524 / 532) | 206.0 | 297.4 | 395.9 |
+| of which the kernel (v0 / after 601bb98fd) | 40 / 29 | 79 / 68 | 126 / 119 |
 | H200 layer eager | 802 | 471 | 479 |
 | H20 layer graph | 198 | 314 | 453 |
 
@@ -197,17 +201,18 @@ Kernel (routed experts + 8-way reduce), 896 experts:
 | unique experts / bytes per rank, MB | 16 / 35 | 28 / 61 | 51 / 112 | 88 / 193 | 121 / 265 | 153 / 336 |
 | SOL at 4.8 TB/s peak, us | 7.3 | 12.8 | 23.3 | 40.2 | 55.3 | 69.9 |
 | SOL at 4.0 TB/s achievable, us | 8.8 | 15.4 | 28.0 | 48.3 | 66.4 | 83.9 |
-| measured H200 TP8, us | 39.5 | 47.4 | 60.4 | 79.2 | 98.7 | 126.0 |
-| achieved HBM bandwidth, TB/s | 0.89 | 1.30 | 1.85 | 2.44 | 2.69 | 2.66 |
-| **% of SOL (4.0 TB/s)** | **22** | **32** | **46** | **61** | **67** | **67** |
-| % of peak 4.8 TB/s | 19 | 27 | 39 | 51 | 56 | 55 |
+| measured H200 TP8, us (601bb98fd, job 5530640) | 28.8 | 36.5 | 48.2 | 67.7 | 93.5 | 119.1 |
+| achieved HBM bandwidth, TB/s | 1.22 | 1.68 | 2.32 | 2.85 | 2.83 | 2.81 |
+| **% of SOL (4.0 TB/s)** | **31** | **42** | **58** | **71** | **71** | **70** |
+| % of peak 4.8 TB/s | 25 | 35 | 48 | 59 | 59 | 59 |
+| v0 H200 TP8, us / % of SOL | 39.5 / 22 | 47.4 / 32 | 60.4 / 46 | 79.2 / 61 | 98.7 / 67 | 126.0 / 67 |
 | H20 TP8, % of its 4.0 TB/s SOL | 21 | 29 | 40 | 48 | 52 | 53 |
 
-M = 1 is 22 % of SOL and the gap is latency, not bandwidth: 16 panels x 3 items x 28 k-tiles is one wave on 132 SMs with a dependent
-FC1 -> FC2 chain, a 16-slot combine and a one-shot barrier, which is why M = 1 costs the same ~40 us on H20 and H200. From M >= 8 the
-kernel sits at 61-67 % of achievable bandwidth (2.4-2.7 TB/s), a +8-14 point gain over H20 and in line with the DeepSeek tp4moe2 kernel
-(23-54 % on H20). The remaining third at large M is the FC2 k-tile serialization and the tail (combine + reduce) that no longer hides
-behind loads.
+M = 1 is 31 % of SOL and the gap is latency, not bandwidth: 16 panels x 3 items x 28 k-tiles is one wave on 132 SMs with a dependent
+FC1 -> FC2 chain, a 16-slot combine and a one-shot barrier (28.8 us on H200 vs 29.5 on H20 after 601bb98fd; v0 was ~40 us on both).
+From M >= 8 the kernel sits at 70-71 % of achievable bandwidth (2.8 TB/s), up from 61-67 % on v0 and well above the DeepSeek tp4moe2
+kernel (23-54 % on H20). The remaining 30 % at large M is the FC2 k-tile serialization and the tail (combine + reduce) that no longer
+hides behind loads.
 
 Whole layer, counting every weight the block must read per rank per layer with everything sharded 8 ways (router 1.6 MB, W_down 6.4,
 W_up 6.4, shared expert 33.0, total 47.5 MB dense + the routed experts above; the current glue reads 71.6 MB of dense weights because
@@ -249,6 +254,7 @@ Routed experts only, one GPU (the baselines have no cross-rank reduce; our TP8 f
 |---|---|---|---|---|---|---|
 | unique experts / bytes per rank, MB | 16 / 35 | 28 / 61 | 51 / 112 | 88 / 193 | 121 / 265 | 153 / 336 |
 | **ours, single GPU (ndev 1)** | **25.4** | **33.1** | **44.1** | **61.6** | **86.4** | **106.7** |
+| **ours, TP8 incl. 8-way reduce (job 5530640)** | **28.8** | **36.5** | **48.2** | **67.7** | **93.5** | **119.1** |
 | ours v0 (before the cleanup + small-M work), single GPU | 36.7 | 44.3 | 56.7 | 74.5 | 92.5 | 113.6 |
 | ours v0, TP8 incl. 8-way reduce | 39.6 | 47.3 | 60.4 | 78.9 | 98.4 | 125.8 |
 | Marlin MXFP4 W4A16 (viking-prod-260 re-run: 33.3 / 44.5 / 70.6 / 100.9 / 134.2 / 168.2) | 33.4 | 44.5 | 70.3 | 101.1 | 133.9 | 168.2 |
@@ -257,6 +263,7 @@ Routed experts only, one GPU (the baselines have no cross-rank reduce; our TP8 f
 | NCCL all-reduce [M, 3584] bf16 x 8 (what a baseline adds under TP8) | 21.9 | 22.3 | 23.4 | 27.2 | 26.7 | 21.8 |
 | ours ndev 1 vs Marlin | 1.31x | 1.34x | 1.60x | 1.64x | 1.55x | 1.58x |
 | ours ndev 1 vs Humming W4A8 | 3.08x | 2.89x | 2.84x | 2.81x | 2.50x | 2.43x |
+| ours TP8 vs Marlin + NCCL | 1.92x | 1.83x | 1.94x | 1.90x | 1.72x | 1.60x |
 | ours v0 TP8 vs Marlin + NCCL | 1.40x | 1.41x | 1.55x | 1.63x | 1.63x | 1.51x |
 | achieved HBM TB/s: ours ndev 1 / Marlin / Humming | 1.38 / 1.05 / 0.45 | 1.84 / 1.38 / 0.64 | 2.54 / 1.59 / 0.89 | 3.13 / 1.91 / 1.11 | 3.07 / 1.98 / 1.23 | 3.15 / 2.00 / 1.29 |
 | % of SOL at 4.0 TB/s: ours ndev 1 / Marlin / Humming | 34 / 26 / 11 | 46 / 35 / 16 | 64 / 40 / 22 | 78 / 48 / 28 | 77 / 50 / 31 | 79 / 50 / 32 |
@@ -265,7 +272,9 @@ Reading: the kernel is the fastest of the set at every M (1.31-1.64x over Marlin
 W4A16 path) and reaches 64-79 % of achievable HBM bandwidth from M = 4 where Marlin plateaus at 50 % and Humming at ~30 %. The v0 rows
 show the state before the cleanup (72e08e484) and the small-M work (601bb98fd): at M = 1 v0 was 3.3 us behind Marlin; the block-wide
 table build, the dense x path at M <= 8 and the tail changes took 11.3 us off M = 1 and 11-13 us off M = 2..8 on H200, so the M = 1
-latency floor is now 25.4 us against Marlin's 33.4. The NCCL figure is torch.distributed NCCL 2.30.7 with NVLS disabled
+latency floor is now 25.4 us against Marlin's 33.4. Under TP8, where a baseline needs a separate all-reduce, the kernel with its
+8-way reduce included is 1.6-1.9x Marlin + NCCL (job 5530640 on viking-prod-649 re-measured Marlin at 33.9 / 44.5 / 70.6 / 100.3 /
+133.9 / 168.7, within 0.6 us of the table). The NCCL figure is torch.distributed NCCL 2.30.7 with NVLS disabled
 (`NCCL_NVLS_ENABLE=0`: the multicast bind fails in this container); SGLang's custom one-shot all-reduce would be a few us lower, which
 does not change the ranking.
 
