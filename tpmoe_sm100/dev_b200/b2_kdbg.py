@@ -22,12 +22,18 @@ def main():
     ap.add_argument('--ms', type=int, nargs='+', default=[1, 6, 16, 64])
     ap.add_argument('--grid', type=int, default=0)
     ap.add_argument('--flags', default='', help='extra nvcc -D flags for the kernel build (own build dir)')
+    ap.add_argument('--src', default='tpmoe_b2.cu', help='kernel source (A/B against a snapshot; own build dir)')
+    ap.add_argument('--percta', type=int, nargs='*', default=[], help='Ms whose per-CTA FC1 owner timeline is printed')
     ap.add_argument('--shared', action='store_true', help='fused shared expert (production DeepGEMM slice) vs the production shared output')
     ap.add_argument('--force', action='store_true', help='every token routed to experts 3 50 100 150 200 250 (wide panels), given top-k')
     args = ap.parse_args()
     dev = torch.device('cuda', 0)
     torch.backends.cuda.matmul.allow_tf32 = False
-    KE = tpb2.load_ext(tag=('_' + args.flags.replace('-D', '').replace('=', '').replace(' ', '_')) if args.flags else '', flags=tuple(args.flags.split()))
+    args.flags = (args.flags.replace(',', ' ') + ' -DTPB2_DBG=1').strip()   # (comma-separated on the command line; stamps need the dbg code)
+    tag = ('_' + args.flags.replace('-D', '').replace('=', '').replace(' ', '_')) if args.flags else ''
+    if args.src != 'tpmoe_b2.cu':
+        tag += '_' + args.src.replace('.cu', '').replace('tpmoe_b2_', '')
+    KE = tpb2.load_ext(src=args.src, tag=tag, flags=tuple(args.flags.split()))
     st = tpb2.RankState(KE, dev, ndev=1, rank=0)
     if args.grid:
         st.grid = args.grid
@@ -45,7 +51,7 @@ def main():
     def stamps():   # per-CTA phase times (us from the CTA's start): medians and maxima
         d = st.dbg.view(st.grid, 32).double().cpu()
         t0 = d[:, 0:1]
-        names = {1: 'tables', 2: 'quant', 8: 'x_ready', 9: 'mma_first', 3: 'fc1_issued', 10: 'mma_fc1_last', 11: 'epi_first_fc1', 12: 'epi_last_fc1_acc',
+        names = {25: 'init', 26: 'pdl_wait', 27: 'gate', 1: 'tables', 2: 'quant', 28: 'tma_first', 8: 'x_ready', 29: 'b_first', 9: 'mma_first', 3: 'fc1_issued', 10: 'mma_fc1_last', 11: 'epi_first_fc1', 12: 'epi_last_fc1_acc',
                  13: 'epi_last_merge', 14: 'swiglu', 15: 'am_bar', 4: 'fc1_last_epi', 5: 'fc2_end', 6: 't1_end', 7: 'end'}
         rel = (d - d[:, 0].min()) / 1e3
         out = []
@@ -53,9 +59,12 @@ def main():
             v = rel[:, k][d[:, k] > 0]
             if len(v):
                 out.append(f'{nm} {float(v.median()):.1f}/{float(v.max()):.1f}')
-        sums = {16: 'mma_wait_full', 17: 'mma_wait_acce', 18: 'epi_wait_accf', 19: 'epi_busy', 20: 'prod_wait_empty', 21: 'prod_wait_hflag',
+        sums = {16: 'mma_wait_full', 17: 'merge_flag_wait', 18: 'epi_wait_accf', 19: 'epi_busy', 20: 'prod_wait_empty', 21: 'prod_wait_hflag',
                 22: 'FC1_mma_wait_full', 23: 'FC1_mma_issue', 24: 'FC1_prod_wait_empty'}
-        out.append('| FC2 sums us (median/max): ' + '  '.join(f'{nm} {float(d[:, k].median()) / 1e3:.1f}/{float(d[:, k].max()) / 1e3:.1f}' for k, nm in sums.items()))
+        clk = ((d[:, 31] - d[:, 30]) / (d[:, 7] - d[:, 0]).clamp(min=1)).median()   # GHz (cycles per ns): the in-loop sums are cycles
+        out.append('| sums us (median/max): ' + '  '.join(f'{nm} {float(d[:, k].median() / clk) / 1e3:.1f}/{float(d[:, k].max() / clk) / 1e3:.1f}' for k, nm in sums.items()))
+        clk = (d[:, 31] - d[:, 30]) / (d[:, 7] - d[:, 0]).clamp(min=1)
+        out.append(f'| SM clock GHz (median/min) {float(clk.median()):.3f}/{float(clk.min()):.3f}')
         return '  '.join(out)
     for m in args.ms:
         x = xs[m]
@@ -195,6 +204,18 @@ def main():
         cnt = torch.bincount(i.flatten().long(), minlength=256)
         ptot = int(((cnt + 31) // 32).sum())
         print(f'   panels {ptot} (FC1 {ptot * 2.125:.0f} MB, FC2 {ptot * 1.0625:.0f} MB)  stamps (median/max us from grid start): {stamps()}', flush=True)
+        if args.percta and m in args.percta:   # per-CTA timeline of the owners (stamp 12 = acc ready, 13 = merge done, 4 = h published)
+            d = st.dbg.view(st.grid, 32).double().cpu()
+            t0 = d[:, 0].min()
+            rows = []
+            for c in range(st.grid):
+                if d[c, 4] > 0:
+                    rows.append((float((d[c, 4] - t0) / 1e3), c, float((d[c, 9] - t0) / 1e3), float((d[c, 10] - t0) / 1e3), float((d[c, 12] - t0) / 1e3) if d[c, 12] > 0 else -1,
+                                 float((d[c, 13] - t0) / 1e3) if d[c, 13] > 0 else -1, float(d[c, 17] / 1.85 / 1e3)))
+            rows.sort()
+            print('   per-CTA (h published, cta, mma_first, mma_fc1_last, acc_ready, merge_done, flag_wait us):', flush=True)
+            for r in rows[-12:]:
+                print('     ' + '  '.join(f'{v:6.1f}' if isinstance(v, float) else f'{v:4d}' for v in r), flush=True)
         ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         st.dbg = None
         for _ in range(3):

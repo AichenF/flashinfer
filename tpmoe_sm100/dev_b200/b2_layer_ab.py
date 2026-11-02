@@ -54,25 +54,54 @@ def worker(rank, args):
     alt = torch.cuda.Stream()
     import tpb2
     from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-    KE = tpb2.load_ext(tag=('_' + args.flags.replace('-D', '').replace('=', '').replace(' ', '_')) if args.flags else '', flags=tuple(args.flags.split()))
-    st = tpb2.RankState(KE, dev, ndev, rank)
+    args.flags = args.flags.replace(',', ' ')   # (comma-separated on the command line: run_b2.sh re-splits spaces)
+    for f_ in ('flags', 'flags2', 'flags3', 'xbuilds'):   # '@R' in build flags: this rank (per-rank builds, e.g. -DTPB2_RANK=@R)
+        if getattr(args, f_, None): setattr(args, f_, getattr(args, f_).replace('@R', str(rank)))
+    if args.stamps:
+        args.flags = (args.flags + ' -DTPB2_DBG=1').strip()
+    if args.trace:
+        args.flags = (args.flags + ' -DTPB2_TRACE=1').strip()
+    tagf = lambda f: ('_' + f.replace('-D', '').replace('=', '').replace(' ', '_')) if f else ''
+    KE = tpb2.load_ext(tag=tagf(args.flags), flags=tuple(args.flags.split()))
     lib = CudaRTLibrary()
-    keep, tables = [], []
-    for nbytes in [tpb2.RankState.RS_BYTES(KE), tpb2.RankState.AG_BYTES(KE)]:
-        ptr = lib.cudaMalloc(nbytes)
-        lib.cudaMemset(ptr, 0, nbytes)
-        keep.append(ptr)
-        handle = lib.cudaIpcGetMemHandle(ptr)
-        table = []
-        for peer, rawh in enumerate(gather(bytes(handle))):
-            if peer == rank:
-                table.append(ptr.value)
-            else:
-                pp = lib.cudaIpcOpenMemHandle(type(handle).from_buffer_copy(rawh))
-                keep.append(pp)
-                table.append(pp.value)
-        tables.append(table)
-    st.link_ptrs(*tables)
+    keep = []
+
+    def make_state(E):   # workspace + IPC-linked all-reduce buffers of one kernel build
+        st_ = tpb2.RankState(E, dev, ndev, rank)
+        tables = []
+        for nbytes in [tpb2.RankState.RS_BYTES(E), tpb2.RankState.AG_BYTES(E)]:
+            ptr = lib.cudaMalloc(nbytes)
+            lib.cudaMemset(ptr, 0, nbytes)
+            keep.append(ptr)
+            handle = lib.cudaIpcGetMemHandle(ptr)
+            table = []
+            for peer, rawh in enumerate(gather(bytes(handle))):
+                if peer == rank:
+                    table.append(ptr.value)
+                else:
+                    pp = lib.cudaIpcOpenMemHandle(type(handle).from_buffer_copy(rawh))
+                    keep.append(pp)
+                    table.append(pp.value)
+            tables.append(table)
+        st_.link_ptrs(*tables)
+        return st_
+    st = make_state(KE)
+    KE2 = st2 = None
+    if args.flags2 is not None:   # a second build of the kernel, timed in the same rounds (arm KS2): paired A/B
+        args.flags2 = args.flags2.replace(',', ' ')
+        KE2 = tpb2.load_ext(src=args.src2, tag=tagf(args.flags2) + '_b' + ('' if args.src2 == 'tpmoe_b2.cu' else '_' + args.src2.replace('.cu', '')),
+                            flags=tuple(args.flags2.split()))
+        st2 = make_state(KE2)
+    KE3 = st3 = None
+    if args.flags3 is not None:   # a third build (arm D / DF: per-M dispatch over builds 1..3)
+        args.flags3 = args.flags3.replace(',', ' ')
+        KE3 = tpb2.load_ext(tag=tagf(args.flags3) + '_c', flags=tuple(args.flags3.split()))
+        st3 = make_state(KE3)
+    KX, stx = [], []   # --xbuilds: builds 4, 5, .. (per-M dispatch)
+    for i, f in enumerate(args.xbuilds.split('+') if args.xbuilds else []):
+        f = f.replace(',', ' ').strip()
+        KX.append(tpb2.load_ext(tag=tagf(f) + '_x', flags=tuple(f.split())))
+        stx.append(make_state(KX[-1]))
     prods = []
     for k in range(args.copies):
         layer = C.sglang_trtllm_layer(raw, dev)
@@ -81,6 +110,14 @@ def worker(rank, args):
         prods.append(C.Prod(layer, shk, router, bias, alt, ar))
         prods[-1].kw = tpb2.Weights(KE, layer.w13_weight, layer.w13_weight_scale_inv, layer.w2_weight, layer.w2_weight_scale_inv)
         prods[-1].sw = tpb2.SharedWeights(KE, shk['gu_w'], shared['gs_f'], shk['dn_w'], shared['ds_f'])
+        if KE2 is not None:
+            prods[-1].kw2 = tpb2.Weights(KE2, layer.w13_weight, layer.w13_weight_scale_inv, layer.w2_weight, layer.w2_weight_scale_inv)
+            prods[-1].sw2 = tpb2.SharedWeights(KE2, shk['gu_w'], shared['gs_f'], shk['dn_w'], shared['ds_f'])
+        if KE3 is not None:
+            prods[-1].kw3 = tpb2.Weights(KE3, layer.w13_weight, layer.w13_weight_scale_inv, layer.w2_weight, layer.w2_weight_scale_inv)
+            prods[-1].sw3 = tpb2.SharedWeights(KE3, shk['gu_w'], shared['gs_f'], shk['dn_w'], shared['ds_f'])
+        prods[-1].kwx = [tpb2.Weights(E_, layer.w13_weight, layer.w13_weight_scale_inv, layer.w2_weight, layer.w2_weight_scale_inv) for E_ in KX]
+        prods[-1].swx = [tpb2.SharedWeights(E_, shk['gu_w'], shared['gs_f'], shk['dn_w'], shared['ds_f']) for E_ in KX]
 
     def ours(k, m, with_shared=True):   # router logits + shared on the alt stream, join, the fused kernel
         x = xs[m]
@@ -100,14 +137,122 @@ def worker(rank, args):
         out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
         return tpb2.run(st, Pk.kw, xs[m], out, glog=lg, gbias=bias, SW=Pk.sw)
 
+    RF = None
+    if args.rfuse:   # our router GEMM (b2_rfuse.cu: bitwise == cuBLAS K-parts) for 5 <= M <= 64, PDL-overlapped with the MoE kernel
+        from torch.utils.cpp_extension import load as _load
+        from router_splits import router_parts
+        os.environ['TORCH_CUDA_ARCH_LIST'] = '10.0a'
+        (SRV / 'build_rfuse').mkdir(exist_ok=True)
+        RF = _load(name='b2_rfuse', sources=[str(SRV / 'b2_rfuse.cu')], build_directory=str(SRV / 'build_rfuse'),
+                   extra_cuda_cflags=['-O3', '-gencode=arch=compute_100a,code=sm_100a', '-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK'],
+                   extra_ldflags=['-lcuda'], verbose=False)
+        rparts = {}
+
+    def ours_shr_parts(m):
+        if m not in rparts:
+            sp = router_parts(m)
+            b_, k_ = [], 0
+            for kn in sp:
+                b_ += [k_, kn]; k_ += kn
+            rparts[m] = (b_, len(sp), torch.empty(len(sp), m, 256, dtype=torch.float32, device=dev))
+
+    def ours_shr(k, m):   # our router (5 <= M <= 64; else production's) + the fused kernel with the shared expert inside
+        Pk = prods[k]
+        if RF is None or not (5 <= m <= args.rfmax):
+            return ours_sh(k, m)
+        ours_shr_parts(m)
+        b_, S_, part_ = rparts[m]
+        RF.run(xs[m], Pk.router, part_, b_, None, 1)
+        out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+        return tpb2.run(st, Pk.kw, xs[m], out, glog=part_, gbias=bias, SW=Pk.sw, nparts=S_)
+
+    def our_router(k, m):   # arm RR: our router GEMM alone (5 <= M <= 64), cf. RT
+        ours_shr_parts(m)
+        b_, S_, part_ = rparts[m]
+        RF.run(xs[m], prods[k].router, part_, b_, None, 1)
+        return part_
+
+    rfp = {}
+
+    def ours_shd(k, m):   # arm SD (NOT bitwise for M >= 5): sglang dsv3_router_gemm (FMA chains) as the router at every M <= 16
+        from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
+        lg = dsv3_router_gemm(xs[m], prods[k].router, out_dtype=torch.float32) if m <= 16 else prods[k].logits(xs[m])
+        out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+        return tpb2.run(st, prods[k].kw, xs[m], out, glog=lg, gbias=bias, SW=prods[k].sw)
+
+    def ours_shf(k, m):   # arm SF: the in-kernel router (5 <= M <= 32, K-parts <= 1408) + the fused kernel with the shared expert inside
+        from router_splits import router_parts
+        sp = router_parts(m)
+        if sp == 'dsv3' and m <= 4:   # (M <= 4: production's dsv3_router_gemm reproduced in the kernel)
+            if m not in rfp:
+                rfp[m] = torch.empty(1, m, 256, dtype=torch.float32, device=dev)
+            out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+            return tpb2.run(st, prods[k].kw, xs[m], out, glog=rfp[m], gbias=bias, SW=prods[k].sw, nparts=1, router=(prods[k].router, 'dsv3'))
+        if not isinstance(sp, tuple) or not (5 <= m <= args.rfmax) or max(sp) > 2048:   # (M96/128 in-kernel: bitwise but +2..4.6 us -- 512 KB of x per unit)
+            return ours_sh(k, m)
+        if m not in rfp:
+            rfp[m] = torch.empty(len(sp), m, 256, dtype=torch.float32, device=dev)
+        out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+        return tpb2.run(st, prods[k].kw, xs[m], out, glog=rfp[m], gbias=bias, SW=prods[k].sw, nparts=len(sp), router=(prods[k].router, sp))
+
+    rde = {}
+
+    def ours_she(k, m):   # arm SE (M <= 4): our copy of the dsv3 router (bitwise; W loaded before the PDL wait, dependents triggered early)
+        if m > 4:
+            return ours_sh(k, m)
+        if m not in rde:
+            rde[m] = torch.empty(m, 256, dtype=torch.float32, device=dev)
+        KE.router_dsv3(xs[m], prods[k].router, rde[m])
+        out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+        return tpb2.run(st, prods[k].kw, xs[m], out, glog=rde[m], gbias=bias, SW=prods[k].sw)
+
+    def ours_shf2(k, m):   # arm SF2: the in-kernel router + the second build (M-dispatched builds)
+        from router_splits import router_parts
+        sp = router_parts(m)
+        if not isinstance(sp, tuple) or not (5 <= m <= args.rfmax) or max(sp) > 2048:
+            return ours_sh2(k, m)
+        if m not in rfp:
+            rfp[m] = torch.empty(len(sp), m, 256, dtype=torch.float32, device=dev)
+        out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+        return tpb2.run(st2, prods[k].kw2, xs[m], out, glog=rfp[m], gbias=bias, SW=prods[k].sw2, nparts=len(sp), router=(prods[k].router, sp))
+
+    disp = [tuple(int(v) for v in e.split(':')) for e in args.dispatch.split(',')] if args.dispatch else []
+
+    def ours_disp(k, m, fused):   # arms D / DF: the build for M by --dispatch "maxM:build,..."; DF: the in-kernel router at M5-64
+        from router_splits import router_parts
+        bi = next(b_ for mx, b_ in disp if m <= mx)
+        Pk = prods[k]
+        if bi >= 4:
+            st_, kw_, sw_ = stx[bi - 4], Pk.kwx[bi - 4], Pk.swx[bi - 4]
+        else:
+            st_ = {1: st, 2: st2, 3: st3}[bi]
+            kw_, sw_ = {1: (Pk.kw, Pk.sw), 2: (getattr(Pk, 'kw2', None), getattr(Pk, 'sw2', None)), 3: (getattr(Pk, 'kw3', None), getattr(Pk, 'sw3', None))}[bi]
+        out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+        sp = router_parts(m)
+        if fused and isinstance(sp, tuple) and 5 <= m <= args.rfmax and max(sp) <= 2048:
+            if m not in rfp:
+                rfp[m] = torch.empty(len(sp), m, 256, dtype=torch.float32, device=dev)
+            return tpb2.run(st_, kw_, xs[m], out, glog=rfp[m], gbias=bias, SW=sw_, nparts=len(sp), router=(Pk.router, sp))
+        return tpb2.run(st_, kw_, xs[m], out, glog=Pk.logits(xs[m]), gbias=bias, SW=sw_)
+
     def ours_sh_ker(k, m):
         out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
         return tpb2.run(st, prods[k].kw, xs[m], out, glog=pre[m][0], gbias=bias, SW=prods[k].sw)
 
+    def ours_sh2(k, m):   # arm S2: the production router + the second build (paired S A/B)
+        Pk = prods[k]
+        lg = Pk.logits(xs[m])
+        out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+        return tpb2.run(st2, Pk.kw2, xs[m], out, glog=lg, gbias=bias, SW=Pk.sw2)
+
+    def ours_sh_ker2(k, m):
+        out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
+        return tpb2.run(st2, prods[k].kw2, xs[m], out, glog=pre[m][0], gbias=bias, SW=prods[k].sw2)
+
     def ours_ker(k, m):
         out = torch.empty((m, C.DIM), dtype=torch.bfloat16, device=dev)
         return tpb2.run(st, prods[k].kw, xs[m], out, glog=pre[m][0], gbias=bias, shared=pre[m][4])
-    xs = C.capture_pool(args.cap, args.ms, dev)
+    xs = C.capture_pool(args.cap, args.ms, dev, off=args.xoff)
     torch.cuda.synchronize()
     dist.barrier()
     report = dict(rank=rank, ar=type(ar).__name__, gpu=torch.cuda.get_device_name(dev), timing={}, check={})
@@ -117,6 +262,7 @@ def worker(rank, args):
     arms = {
         'A': lambda k, m: prods[k](xs[m]),
         'RT': lambda k, m: prods[k].logits(xs[m]),
+        'RR': lambda k, m: our_router(k, m),
         'TK': lambda k, m: prods[k].topk(pre[m][0]),
         'RM': lambda k, m: prods[k].routed(xs[m], pre[m][1], pre[m][2]),
         'SH': lambda k, m: prods[k].shared(xs[m]),
@@ -125,12 +271,46 @@ def worker(rank, args):
         'KN': lambda k, m: ours_ker(k, m),
         'S': lambda k, m: ours_sh(k, m),
         'KS': lambda k, m: ours_sh_ker(k, m),
+        'KS2': lambda k, m: ours_sh_ker2(k, m),
+        'S2': lambda k, m: ours_sh2(k, m),
+        'SE': lambda k, m: ours_she(k, m),
+        'SF2': lambda k, m: ours_shf2(k, m),
+        'D': lambda k, m: ours_disp(k, m, False),
+        'DF': lambda k, m: ours_disp(k, m, True),
+        'SR': lambda k, m: ours_shr(k, m),
+        'SF': lambda k, m: ours_shf(k, m),
+        'SD': lambda k, m: ours_shd(k, m),
     }
     if args.arms:
         arms = {a: arms[a] for a in args.arms}
     ncp = args.copies
     seq = [k % ncp for k in range(2 * ncp)]
     rnd = random.Random(1234)
+    if args.sweep:   # bitwise sweep: production layer vs ours (build 1, and build 2 if --flags2) over consecutive capture offsets
+        big = C.capture_pool(args.cap, [args.sweep + max(args.ms)], dev)[args.sweep + max(args.ms)]
+        for m in args.ms:
+            res = [0, 0, 0, 0, 0, 0]   # build 1: offsets with mismatches, elements; build 2: same; build 1 + in-kernel router (--arms SF): same
+            sf = bool(args.arms and 'SF' in args.arms and 5 <= m <= args.rfmax)
+            for off in range(args.sweep):
+                xs[m] = big[off:off + m].contiguous()
+                a = prods[0](xs[m]).clone()
+                s1 = ours_sh(0, m).clone()
+                s2 = ours_sh2(0, m).clone() if st2 is not None else None
+                s3 = ours_shf(0, m).clone() if sf else None
+                torch.cuda.synchronize()
+                n1 = int((s1 != a).sum()); res[0] += n1 > 0; res[1] += n1
+                if s2 is not None:
+                    n2 = int((s2 != a).sum()); res[2] += n2 > 0; res[3] += n2
+                if s3 is not None:
+                    n3 = int((s3 != a).sum()); res[4] += n3 > 0; res[5] += n3
+            allr = gather(res)
+            if rank == 0:
+                print(f'SWEEP M {m}: {args.sweep} offsets  build1 offsets with mismatches {[r_[0] for r_ in allr]} elements {[r_[1] for r_ in allr]}'
+                      + (f'  build2 {[r_[2] for r_ in allr]} elements {[r_[3] for r_ in allr]}' if st2 is not None else '')
+                      + (f'  build1+SF {[r_[4] for r_ in allr]} elements {[r_[5] for r_ in allr]}' if sf else ''), flush=True)
+        if rank == 0:
+            print('B2_LAYER_AB_COMPLETE', flush=True)
+        return
     for m in args.ms:
         P = prods[0]
         lg = P.logits(xs[m])
@@ -148,7 +328,7 @@ def worker(rank, args):
         xq_own = R.quant_mxfp8(xs[m])[0]
         # the fused kernel vs production (full layer, after the all-reduce) and vs the reference (all-reduced in fp32 here)
         a_full = P(xs[m]).clone()
-        o_full = ours(0, m).clone()
+        o_full = (ours_sh(0, m) if 'TPB2_SPEC=1' in (args.flags or '') else ours(0, m)).clone()   # (a SPEC build: fused shared expert only)
         s_full = ours_sh(0, m).clone()
         torch.cuda.synchronize()
         gate_eq = bool(torch.equal(st.ids[:m * 6].view(m, 6), i.to(torch.int32))) and bool(torch.equal(st.rw[:m * 6].view(m, 6), w.float()))
@@ -161,7 +341,69 @@ def worker(rank, args):
                    a_vs_ref=R.rel(a_full.cpu(), ref_full), n_tokmax_ref=R.tok_rel_max(o_full.cpu(), ref_full), gate_eq=gate_eq,
                    n_finite=bool(torch.isfinite(o_full.float()).all()), n_eq_a=bool(torch.equal(o_full, a_full)),
                    n_ne_a=int((o_full != a_full).sum()), s_ne_a=int((s_full != a_full).sum()), s_vs_a=R.rel(s_full, a_full))
+        if RF is not None:   # our router + kernel vs production router + kernel, bitwise
+            srf = ours_shr(0, m).clone()
+            torch.cuda.synchronize()
+            chk['sr_ne_s'] = int((srf != s_full).sum())
+        if args.arms and 'SD' in args.arms:   # dsv3 FMA router (M <= 16) + kernel vs production: how much differs
+            sdf = ours_shd(0, m).clone()
+            torch.cuda.synchronize()
+            chk['sd_ne_s'] = int((sdf != s_full).sum()); chk['sd_vs_s'] = R.rel(sdf, s_full)
+        if args.arms and 'SF' in args.arms:   # in-kernel router + kernel vs production router + kernel, bitwise
+            sff = ours_shf(0, m).clone()
+            torch.cuda.synchronize()
+            chk['sf_ne_s'] = int((sff != s_full).sum())
+            if m <= 4 and m in rfp:   # (dsv3 in the kernel: the logits themselves, bit for bit)
+                lg = prods[0].logits(xs[m]).float()
+                torch.cuda.synchronize()
+                chk['sf_lg_ne'] = int((rfp[m][0].view_as(lg) != lg).sum())
+        if args.arms and 'SE' in args.arms and m <= 4:   # our dsv3 copy: logits and outputs vs production, bitwise
+            sef = ours_she(0, m).clone()
+            lg0 = prods[0].logits(xs[m]).float()
+            torch.cuda.synchronize()
+            chk['se_ne_s'] = int((sef != s_full).sum()); chk['se_lg_ne'] = int((rde[m] != lg0).sum())
+        if args.arms and ('D' in args.arms or 'DF' in args.arms):   # the dispatched layer vs production, bitwise
+            dd = ours_disp(0, m, 'DF' in args.arms).clone()
+            torch.cuda.synchronize()
+            chk['d_ne_a'] = int((dd != a_full).sum())
+        if st2 is not None:   # the second build vs the first, bitwise
+            k1 = ours_sh_ker(0, m).clone()
+            k2 = ours_sh_ker2(0, m).clone()
+            torch.cuda.synchronize()
+            chk['ks2_ne_ks'] = int((k1 != k2).sum())
         report['check'][m] = chk
+        if args.stamps:   # one cold-ish call of the fused kernel (copy 1) with phase stamps: per-CTA median / max (us from the grid's first CTA)
+            st.dbg = torch.zeros(st.grid * 32, dtype=torch.int64, device=dev)
+            for _ in range(2):
+                st.dbg.zero_()
+                (ours_shf if args.trace_arm == 'SF' else ours_sh_ker)(min(1, args.copies - 1), m)
+            torch.cuda.synchronize()
+            dd = st.dbg.view(st.grid, 32).double().cpu()
+            st.dbg = None
+            t0 = dd[:, 0].min()
+            names = {25: 'init', 26: 'pdl_wait', 27: 'gate', 1: 'tables', 2: 'quant', 28: 'tma1', 8: 'x_ready', 29: 'b1', 9: 'mma1', 10: 'mma_fc1_end', 4: 'fc1_epi_end', 5: 'fc2_end', 6: 't1_end', 7: 'end'}
+            line = '  '.join(f'{nm} {float(((dd[:, k] - t0) / 1e3)[dd[:, k] > 0].median()):.1f}/{float(((dd[:, k] - t0) / 1e3)[dd[:, k] > 0].max()):.1f}'
+                             for k, nm in names.items() if bool((dd[:, k] > 0).any()))
+            allst = gather(line)
+            if rank == 0:
+                for r_, l_ in enumerate(allst):
+                    print(f'   stamps M {m} rank {r_}: {l_}', flush=True)
+        if args.trace:   # one cold-ish call (copy 1) with the Xtrace-style phase trace (xtrace.cuh), dumped per rank, shown for rank 0
+            import xtrace
+            st.dbg = torch.zeros(st.grid * (xtrace.HDR + xtrace.WARPS * xtrace.DEPTH * 2), dtype=torch.int64, device=dev)
+            for _ in range(2):
+                st.dbg.zero_()
+                (ours_shf if args.trace_arm == 'SF' else ours_sh_ker)(min(1, args.copies - 1), m)
+            torch.cuda.synchronize()
+            tp = args.out / f'xt_m{m}_r{rank}.json'
+            xtrace.dump(st.dbg, st.grid, dict(kernel='tpmoe_b2', m=m, rank=rank, label=args.flags), tp)
+            st.dbg = None
+            dist.barrier()
+            if rank == 0:
+                import json as _j
+                for r_ in range(ndev):
+                    xtrace.show(_j.loads((args.out / f'xt_m{m}_r{r_}.json').read_text()))
+            dist.barrier()
         if args.rounds == 0:   # correctness only
             allchk = gather(chk)
             if rank == 0:
@@ -169,8 +411,17 @@ def worker(rank, args):
                       f'A vs ref {max(c["a_vs_ref"] for c in allchk):.5f}  N tokmax ref {max(c["n_tokmax_ref"] for c in allchk):.4f}  '
                       f'gate==prod {all(c["gate_eq"] for c in allchk)}  finite {all(c["n_finite"] for c in allchk)}  '
                       f'bitwise N==A {[c["n_eq_a"] for c in allchk]} mismatches {[c["n_ne_a"] for c in allchk]}  '
-                  f'S vs A {max(c["s_vs_a"] for c in allchk):.5f} mismatches {[c["s_ne_a"] for c in allchk]}', flush=True)
+                  f'S vs A {max(c["s_vs_a"] for c in allchk):.5f} mismatches {[c["s_ne_a"] for c in allchk]}'
+                  + (f'  KS2 != KS {[c.get("ks2_ne_ks") for c in allchk]}' if st2 is not None else '')
+                  + (f'  SR != S {[c.get("sr_ne_s") for c in allchk]}' if RF is not None else '')
+                  + (f'  SF != S {[c.get("sf_ne_s") for c in allchk]} logits {[c.get("sf_lg_ne") for c in allchk]}' if args.arms and 'SF' in args.arms else '')
+                  + (f'  SE != S {[c.get("se_ne_s") for c in allchk]} logits {[c.get("se_lg_ne") for c in allchk]}' if args.arms and 'SE' in args.arms else '')
+                  + (f'  D != A {[c.get("d_ne_a") for c in allchk]}' if args.arms and ('D' in args.arms or 'DF' in args.arms) else '')
+                  + (f'  SD != S {[c.get("sd_ne_s") for c in allchk]} rel {[round(c.get("sd_vs_s", 0), 5) for c in allchk]}' if args.arms and 'SD' in args.arms else ''), flush=True)
             continue
+        if args.xt_overhead:   # probes live during the timing (overhead of the Xtrace-style instrumentation vs an unprobed build)
+            import xtrace
+            st.dbg = torch.zeros(st.grid * (xtrace.HDR + xtrace.WARPS * xtrace.DEPTH * 2), dtype=torch.int64, device=dev)
         graphs = {}
         for lab, fn in arms.items():
             for k in range(ncp):
@@ -178,7 +429,7 @@ def worker(rank, args):
             torch.cuda.synchronize()
             dist.barrier()
             g = torch.cuda.CUDAGraph()
-            if lab in ('A', 'AR', 'N', 'KN', 'S', 'KS'):
+            if lab in ('A', 'AR', 'N', 'KN', 'S', 'S2', 'SE', 'SF2', 'D', 'DF', 'KS', 'KS2', 'SR', 'SF', 'SD'):
                 with ar.capture():
                     with torch.cuda.graph(g):
                         for k in seq:
@@ -224,7 +475,13 @@ def worker(rank, args):
                   f'A vs ref {max(c["a_vs_ref"] for c in allchk):.5f}  N tokmax ref {max(c["n_tokmax_ref"] for c in allchk):.4f}  '
                   f'gate==prod {all(c["gate_eq"] for c in allchk)}  finite {all(c["n_finite"] for c in allchk)}  '
                   f'bitwise N==A {[c["n_eq_a"] for c in allchk]} mismatches {[c["n_ne_a"] for c in allchk]}  '
-                  f'S vs A {max(c["s_vs_a"] for c in allchk):.5f} mismatches {[c["s_ne_a"] for c in allchk]}', flush=True)
+                  f'S vs A {max(c["s_vs_a"] for c in allchk):.5f} mismatches {[c["s_ne_a"] for c in allchk]}'
+                  + (f'  KS2 != KS {[c.get("ks2_ne_ks") for c in allchk]}' if st2 is not None else '')
+                  + (f'  SR != S {[c.get("sr_ne_s") for c in allchk]}' if RF is not None else '')
+                  + (f'  SF != S {[c.get("sf_ne_s") for c in allchk]} logits {[c.get("sf_lg_ne") for c in allchk]}' if args.arms and 'SF' in args.arms else '')
+                  + (f'  SE != S {[c.get("se_ne_s") for c in allchk]} logits {[c.get("se_lg_ne") for c in allchk]}' if args.arms and 'SE' in args.arms else '')
+                  + (f'  D != A {[c.get("d_ne_a") for c in allchk]}' if args.arms and ('D' in args.arms or 'DF' in args.arms) else '')
+                  + (f'  SD != S {[c.get("sd_ne_s") for c in allchk]} rel {[round(c.get("sd_vs_s", 0), 5) for c in allchk]}' if args.arms and 'SD' in args.arms else ''), flush=True)
         (args.out / f'rank-{rank}.json').write_text(json.dumps(report, indent=1) + '\n')
         del graphs
         dist.barrier()
@@ -236,6 +493,12 @@ def worker(rank, args):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--ndev', type=int, default=4)
+    ap.add_argument('--xoff', type=int, default=0, help='first capture-pool row of the M tokens (other inputs for the bitwise checks)')
+    ap.add_argument('--sweep', type=int, default=0, help='bitwise sweep over this many consecutive capture offsets per M (no timing)')
+    ap.add_argument('--flags3', default=None, help='a third kernel build (arms D / DF)')
+    ap.add_argument('--rfmax', type=int, default=64, help='in-kernel router (arms SF / SF2 / DF) up to this M (M96/128 need -DTPB2_RRB=1)')
+    ap.add_argument('--xbuilds', default=None, help='more builds (4, 5, ..) for --dispatch: "f,f+f,f+.." (+ between builds, , between flags)')
+    ap.add_argument('--dispatch', default='', help='arms D / DF: "maxM:build,..." e.g. "8:3,24:1,512:2"')
     ap.add_argument('--model', required=True)
     ap.add_argument('--cap', required=True)
     ap.add_argument('--out', type=Path, required=True)
@@ -244,6 +507,13 @@ if __name__ == '__main__':
     ap.add_argument('--copies', type=int, default=4)
     ap.add_argument('--rounds', type=int, default=5)
     ap.add_argument('--arms', nargs='*')
+    ap.add_argument('--stamps', action='store_true', help='phase stamps of one fused-kernel call per M (per rank)')
+    ap.add_argument('--rfuse', action='store_true', help='arm SR: our router kernel (b2_rfuse.cu) + the fused kernel')
+    ap.add_argument('--src2', default='tpmoe_b2.cu', help='kernel source of the KS2 build (e.g. a snapshot)')
+    ap.add_argument('--flags2', default=None, help='a second kernel build (comma-separated -D flags), timed as arm KS2 in the same rounds')
+    ap.add_argument('--xt-overhead', action='store_true', help='with -DTPB2_TRACE=1 in --flags: keep the xtrace buffer live in the timed calls')
+    ap.add_argument('--trace-arm', default='KS', help='--trace: the traced call (KS: precomputed logits; SF: the in-kernel router)')
+    ap.add_argument('--trace', action='store_true', help='per-CTA event trace of one fused-kernel call per M (TPB2_TRACE; saved + analyzed)')
     ap.add_argument('--flags', default='', help='extra nvcc -D flags for the fused kernel build (own build dir)')
     args = ap.parse_args()
     assert torch.cuda.device_count() >= args.ndev

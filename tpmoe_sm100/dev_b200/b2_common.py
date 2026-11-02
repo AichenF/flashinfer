@@ -114,15 +114,15 @@ def load_router(model, wm, index, dev):
     return ck(f'layers.{index}.ffn.gate.weight').bfloat16().contiguous(), ck(f'layers.{index}.ffn.gate.bias').float().contiguous()
 
 
-def capture_pool(cap, ms, dev, layer_key='layer-20-module-20'):
+def capture_pool(cap, ms, dev, layer_key='layer-20-module-20', off=0):
     rows = []
     for label in ['c8', 'c4', 'c1']:
         batch = torch.load(Path(cap) / (label + '.pt'), map_location='cpu', weights_only=False)
         rows += [v['x'] for (key, _), v in batch.items() if key == layer_key]
     pool = torch.cat(rows).to(dev).bfloat16().contiguous()
-    while pool.shape[0] < max(ms):
+    while pool.shape[0] < max(ms) + off:
         pool = torch.cat([pool, (pool * 1.01).bfloat16()])
-    return {m: pool[:m].contiguous() for m in ms}
+    return {m: pool[off:off + m].contiguous() for m in ms}
 
 
 class Prod:

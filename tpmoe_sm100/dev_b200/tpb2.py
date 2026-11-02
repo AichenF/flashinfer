@@ -14,6 +14,8 @@ FC2_ROW_OF_LANE = (0, 4, 8, 12, 16, 20, 24, 28, 1, 5, 9, 13, 17, 21, 25, 29, 2, 
 
 
 def load_ext(src='tpmoe_b2.cu', tag='', flags=()):
+    import re
+    tag = re.sub(r'[^A-Za-z0-9_]', '_', tag)   # (an extension / module name: identifiers only)
     key = (src, tag, tuple(flags))
     if key in _EXT:
         return _EXT[key]
@@ -42,13 +44,16 @@ class RankState:
         self.dbg = None
         self.himg = torch.zeros(E.MAXP * E.NCH2 * E.NMAX * 128, dtype=torch.uint8, **z)
         self.hsf = torch.zeros(E.MAXP * E.NSTG2 * 512, dtype=torch.uint8, **z)
-        self.part = torch.zeros(E.MAXG * 2 * E.NMAX * 128, dtype=torch.float32, **z)
+        self.part = torch.zeros(E.MAXG * 4 * E.NMAX * 128, dtype=torch.float32, **z)   # (TPB2_LLMERGE: 64-bit tagged values)
         self.xgs = torch.zeros(E.MAXPS * E.NCH1 * E.NMAX * 128, dtype=torch.uint8, **z)   # fused shared expert workspace
         self.xgsfs = torch.zeros(E.MAXPS * E.NSTG1 * 512, dtype=torch.uint8, **z)
         self.hsimg = torch.zeros(E.MAXPS * E.NCH2 * E.NMAX * 128, dtype=torch.uint8, **z)
         self.hssf = torch.zeros(E.MAXPS * E.NSTG2 * 512, dtype=torch.uint8, **z)
         self.shout = torch.zeros(E.MAXM * 4096, dtype=torch.bfloat16, **z)
-        self.part_flags = torch.zeros(E.MAXG, dtype=torch.int32, **z)
+        self.xd = torch.zeros(E.MAXG * getattr(E, "DPRIV", 1), dtype=torch.uint8, **z)   # dense mode: per-CTA private x images
+        self.xsf2 = torch.zeros(E.MAXM * 16 * 16, dtype=torch.uint8, **z)   # token-major SFB-layout x scales (gather4)
+        self.tcnt = torch.zeros(2 * E.MAXM * E.NRT + getattr(E, 'LL_INTS', 0), dtype=torch.int32, **z)   # T1 counts per (token, 256-row tile) + T1LL images
+        self.part_flags = torch.zeros(2 * E.MAXG, dtype=torch.int32, **z)   # (rr tail pieces: slots MAXG + b)
         self.xflag = torch.zeros(2 * E.MAXM, dtype=torch.int32, **z)
         self.gcnt = torch.zeros(2, dtype=torch.int32, **z)
         self.pan_cnt = torch.zeros(2 * E.MAXP, dtype=torch.int32, **z)
@@ -56,7 +61,7 @@ class RankState:
         self.fc2_next = torch.zeros(4, dtype=torch.int32, **z)
         self.rt_cnt = torch.zeros(2 * E.NRT, dtype=torch.int32, **z)
         self.work = torch.zeros(4, dtype=torch.int32, **z)
-        self.outp = torch.zeros(E.MAXM * 8 * 4096, dtype=torch.bfloat16, **z)
+        self.outp = torch.zeros(E.MAXM * 8 * getattr(E, 'OUTP_LD', 4096), dtype=torch.bfloat16, **z)
         self.ids = torch.zeros(E.MAXM * 6, dtype=torch.int32, **z)
         self.rw = torch.zeros(E.MAXM * 6, dtype=torch.float32, **z)
         self.lanes = torch.tensor(FC2_ROW_OF_LANE, dtype=torch.uint8, device=dev)
@@ -100,7 +105,7 @@ class SharedWeights:
         self.sfa2 = images(ds).to(gu_w.device)
 
 
-def run(st, W, x, out, glog=None, gbias=None, ids=None, rw=None, shared=None, factor=1.5, SW=None):
+def run(st, W, x, out, glog=None, gbias=None, ids=None, rw=None, shared=None, factor=1.5, SW=None, nparts=1, router=None):
     """out [M, 4096] bf16 = all-reduce over the TP group of (shared + factor * routed); fused gate when glog is given"""
     E = st.E
     M = x.shape[0]
@@ -111,5 +116,25 @@ def run(st, W, x, out, glog=None, gbias=None, ids=None, rw=None, shared=None, fa
     E.run(W.maps, W.w13_sf, W.w2_sf, st.lanes, x, glog, gbias, ids_t, rw_t, shared, float(factor), st.xq, st.xs, st.xg, st.xgsf, st.dbg, st.himg, st.hsf,
           st.part, st.part_flags, st.xflag, st.gcnt, st.pan_cnt, st.rdy, st.fc2_next, st.rt_cnt, st.work, st.outp, st.rs, st.ag, out,
           st.rank, st.ndev, st.grid, SW.maps if SW else None, SW.sfa1 if SW else None, SW.sfa2 if SW else None,
-          st.xgs, st.xgsfs, st.hsimg, st.hssf, st.shout)
+          st.xgs, st.xgsfs, st.hsimg, st.hssf, st.shout, *_extra_args(E, st, W, SW, nparts, router))
     return out
+
+
+def _extra_args(E, st, W=None, SW=None, nparts=1, router=None):   # (snapshot A/B: v19 has no xd / tcnt arguments, v20 no tcnt; v23+: ABI names its extras)
+    if getattr(E, 'ABI', None) == 'xsf2':
+        return (st.xsf2,)
+    if getattr(E, 'ABI', None) == 'xsf2,tcnt':
+        return (st.xsf2, st.tcnt)
+    if getattr(E, 'ABI', None) == 'xsf2,tcnt,wptr':
+        wp = [W.w13.data_ptr(), W.w2.data_ptr(), SW.gu_w.data_ptr() if SW else 0, SW.dn_w.data_ptr() if SW else 0]
+        if nparts > 1 or router is not None:
+            wp.append(nparts)   # (glog = [nparts][M][256] K-part partials of our router, summed in order by the gate)
+        if router is not None:   # in-kernel router: (W [256][4096] bf16, K-part lengths); the kernel writes glog itself
+            rwt, parts = router
+            wp.append(rwt.data_ptr())
+            k = 0
+            for kn in (() if isinstance(parts, str) else parts):   # ('dsv3': M <= 4, the kernel's FMA router, no K-parts)
+                wp += [k, kn]; k += kn
+        return (st.xsf2, st.tcnt, wp)
+    n = E.run.__doc__.split('->')[0].count('arg')
+    return (st.xd, st.tcnt)[:max(0, n - 42)]
