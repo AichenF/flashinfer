@@ -158,7 +158,6 @@ struct alignas(64) Params {
     int M, n_exp, my_rank, ndev;
     int dense, md;                           // dense mode (small M): FC1 B operand = x rows 0..md-1 for every expert, no gather
     int groups;                              // FC1 panel groups (1 or 2): host-chosen by M (2 at M >= env TP2_GROUPS_MINM, default 16)
-    int pdl_early;                           // PDL launch: 1 = routing tables (ids only) + first weight loads before griddepcontrol.wait
     unsigned long long* dbg;                 // [grid][NSTAMP] globaltimer stamps (TP2_STAMPS builds)
     unsigned long long* tl;                  // [grid][16 units][8] clock64 timeline of the first FC2 units (TP2_STAMPS builds)
 };
@@ -209,7 +208,6 @@ __device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* bar, unsigned by
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(smem_u32(bar)), "r"(bytes) : "memory");
 }
 __device__ __forceinline__ void mbar_arrive(uint64_t* bar) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(smem_u32(bar)) : "memory"); }
-__device__ __forceinline__ void mbar_arrive_cnt(uint64_t* bar, unsigned n) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0], %1;" :: "r"(smem_u32(bar)), "r"(n) : "memory"); }
 __device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned parity) {
     asm volatile("{\n .reg .pred p;\nW_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra W_%=;\n}\n" :: "r"(smem_u32(bar)), "r"(parity) : "memory");
 }
@@ -257,9 +255,6 @@ static_assert(512 * TP2_CONS_REGS + 128 * TP2_PROD_REGS <= 61440, "register pool
 #define TP2_EARLY_XQ_MAXM 64   // compact panels: the producer warpgroup acquires every token flag in the prologue up to this M (M 128: +1.5..2.5 us --
                                // the late flags hold the __syncthreads and with it the pass-A weight loads)
 #endif
-// programmatic dependent launch: everything that reads the previous kernels' outputs (x, xs, shared, routing weights) or this
-// kernel's own global workspace (epoch, counters -- the previous launch of this kernel may be the prerequisite grid) follows it
-__device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void named_bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 __device__ __forceinline__ unsigned ld_acquire_gpu(const unsigned* p) { unsigned v; asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
 __device__ __forceinline__ unsigned ld_relaxed_gpu(const unsigned* p) { unsigned v; asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
@@ -726,7 +721,6 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
             mbar_arrive_expect_tx(&full[nA], (unsigned)(STAGE_WS + np * 128));
             const int row = I.e * (NKT1 * 4) + kt * 4;
             if (P.dense && nA == 1) {   // the TMA unit works in issue order: stage 0's x goes right behind its weights
-                griddep_wait();          // (PDL: the previous kernel -- shorter than the table build -- has usually finished)
                 if (P.xb) {
                     if (early_xs) asm volatile("fence.proxy.async.global;" ::: "memory");   // (flags acquired by warp 19 before the __syncthreads)
                     else wait_tokens(P, 0, 1);
@@ -742,7 +736,6 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
         gk = (it + 1) * NKT1;
     }
     }
-    griddep_wait();   // pass A read weights only (dense: and x after stage 0); the workspace from here on
     if (P.xb && P.dense && nA <= 1) {
         if (early_xs) asm volatile("fence.proxy.async.global;" ::: "memory");
         else wait_tokens(P, 0, 1);
@@ -1340,16 +1333,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     }
     const bool small_tab = P.M * P.topk <= 128 && P.M <= NMAX;   // block-wide small tables (warps 0..7, build_tables_small3)
     // fused quantization threads (small tables: warps 8..15; block-wide tables: the producer warpgroup).  x is complete before the
-    // routing kernels (they read it) and the previous launch (same workspace) completed before them; every thread waits first
-    // (running the quantization before griddepcontrol.wait under a PDL launch measured neutral)
+    // routing kernels (they read it) and the previous launch (same workspace) completed before them
     const bool early_xs = P.dense && P.xb && small_tab;   // dense + fused quantization: warp 19 acquires the token flags (+ stages the owners'
                                                           // scales) during the prologue (the producer warpgroup is idle), so the producer
                                                           // issues stage 0's x right behind its weights (no flag round trip after the tables)
     const bool early_xq = P.xb && !P.dense && P.M <= TP2_EARLY_XQ_MAXM;   // compact panels + fused quantization: the producer warpgroup acquires
                                                           // every token flag during the prologue (after its own quantization), so the consumers
                                                           // start the x gather right after the __syncthreads (no flag round trip)
-    if (!P.pdl_early || P.xb) griddep_wait();   // (no-op when not PDL-launched; fused quantization: the routing is the previous kernel)
-    STAMP(P, 35);   // (stamps) past the PDL wait: > start when launched before the previous kernel completed
+    STAMP(P, 35);
     unsigned ep_early = 0u;   // epoch counter (final: the previous launch completed): one pinned load now, stored to smem before the sync
     if (tid == 0) asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(ep_early) : "l"(P.work));   // (latency under the table build)
     if (tid < NST) mbar_init(&full[tid], 1u);   // the producer lane's expect_tx arrive (+ tx bytes)
@@ -1387,8 +1378,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     STAMP(P, 1);
     if (warp >= PROD_WARP) {
         setmaxnreg_dec<TP2_PROD_REGS>();
-        if (warp == PROD_WARP) { if ((tid & 31) == 0) producer(P, smem, full, empty, T, s_unit, early_xs); return; }   // waits after pass A
-        griddep_wait();
+        if (warp == PROD_WARP) { if ((tid & 31) == 0) producer(P, smem, full, empty, T, s_unit, early_xs); return; }
         const unsigned epoch = (unsigned)T.misc[6] + 1u, par = epoch & 1u;
         if (blockIdx.x == 0) {   // next launch's parity set (unused by this launch; the previous launch has completed): warps 17..19
             const int t2 = tid - NCONS - 32;
@@ -1412,7 +1402,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
         return;
     }
     setmaxnreg_inc<TP2_CONS_REGS>();
-    griddep_wait();
     const unsigned epoch = (unsigned)T.misc[6] + 1u, par = epoch & 1u;
     const Lane L = lane_of();
     const int G = gridDim.x, b = blockIdx.x;
@@ -1688,13 +1677,8 @@ void run(torch::Tensor xq, torch::Tensor xs, torch::Tensor w1, torch::Tensor s1,
         TORCH_CHECK(cudaFuncSetAttribute(tp8moe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_ALLOC) == cudaSuccess, "smem attribute");
         attr[dev] = true;
     }
-    static const int pdl = getenv("TP2_PDL") ? atoi(getenv("TP2_PDL")) : 0;   // 0 off, 1 tables before the wait, 2 wait first
-    P.pdl_early = pdl == 1 ? 1 : 0;
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(grid); cfg.blockDim = dim3(NTHREADS); cfg.dynamicSmemBytes = SMEM_ALLOC; cfg.stream = at::cuda::getCurrentCUDAStream();
-    cudaLaunchAttribute at[1];
-    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
     TORCH_CHECK(cudaLaunchKernelEx(&cfg, tp8moe_kernel, P) == cudaSuccess, "launch");
     const cudaError_t e = cudaGetLastError();
     TORCH_CHECK(e == cudaSuccess, "launch failed: ", cudaGetErrorString(e));

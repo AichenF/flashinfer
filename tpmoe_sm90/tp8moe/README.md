@@ -130,7 +130,7 @@ FC1 done 25.3 -> 16.7 (15.1; max 27.6 -> 18.3), FC2 done 35.0 -> 25.7 (23.9), ex
 Measured and rejected (numbers at M = 1 unless noted; the compile-time knobs named here were removed from the kernel afterwards, only the
 runtime env `TP2_GROUPS_MINM` / `TP2_DENSE_MAXM` overrides remain): per-row x TMA (was `TP2_ROWX` 2: 39.2 vs 38.9); two panel groups
 (`TP2_GROUPS_MINM=1`: 38.5); CTA-local quantization (was `TP2_LQUANT_MAXM` 2 / 8: +0.3 / +0.4 -- the token flag is hidden under the
-tables); PDL launch (no `launch_dependents` in the kernel: 0); dense epilogue credit in the stream-K cost (was `TP2_EPI_SCALE_DENSE` 100 /
+tables); PDL launch (was env `TP2_PDL`; no `launch_dependents` in the kernel: 0); dense epilogue credit in the stream-K cost (was `TP2_EPI_SCALE_DENSE` 100 /
 200: -0.2 / 0.0, although owner CTAs finish FC1 1.5-2 us after non-owners); an early pass issuing 1-7 stages of weight TMAs from the
 producer warp during the table build (was `TP2_EARLY_TMA`, it sorts the <= 32 ids itself: +0.8..+1.2 us -- the burst is HBM-bound either
 way and the queued TMA requests held up the producer's `setmaxnreg` after the sync); grabbing the next T1 item ahead (the first CTAs took
