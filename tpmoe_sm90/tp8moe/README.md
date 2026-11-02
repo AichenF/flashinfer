@@ -45,11 +45,11 @@ scalings exist in the checkpoint (attn_res_block_size 12) and are outside this b
 - Removed from the tp4moe2 source: the fused sqrt-softplus top-6 router and router GEMM (K3 routes with a sigmoid gate, computed outside),
   the fused FP8 shared expert (K3's is full-width 7168 and belongs to the second reduce stage), the RS + AG tail (14 row tiles do not
   split over 8 ranks), the CTA-local dense quantization (hard-coded to 4096-wide rows) and the timing-diagnostic knobs. Dense mode
-  (`TP2_DENSE_MAXM`, default off) is kept but untuned for 896 experts.
+  (`TP2_DENSE_MAXM`) is kept and is the default at M <= 8 (see the small-M section).
 - ptxas: 96 registers (640-thread launch bound), 80 B stack frame (the 16-slot T1 combine spills; tp4moe2 had none).
 
-**Shared with `serving_tp4moe2_v26/`, and why the kernel is a separate file.** The k-loop pipeline headers (`kpipe.cuh`, `chain4.cuh`)
-are the tp4moe2 files, included from `../serving_tp4moe2_v26` (`tp8moe_host.py` adds the `-I`). `tp8moe.cu` is `tp4moe2_ns.cu`
+**Shared with `serving_tp4moe2_v26/`, and why the kernel is a separate file.** The k-loop pipeline header (`kpipe.cuh`)
+is the tp4moe2 file, included from `../serving_tp4moe2_v26` (`tp8moe_host.py` adds the `-I`). `tp8moe.cu` is `tp4moe2_ns.cu`
 generalized (`ITEMS` / `NKT1` / `NRT` / `NEXP` / `TOPK_MAX` / `NDEV` instead of the hard-coded 4 / 32 / 16 / 256 / 8 / 4, wider bit
 fields: expert 10 bits, pid at bit 20, 16-bit slot masks) plus the K3-only pieces above. It is not folded into the tp4moe2 sources
 because that package is frozen (`sources.json` pins every file by SHA-256) and the wider bit fields change the validated binary. The
@@ -113,12 +113,12 @@ What the M = 1 timeline looked like (`-DTP2_STAMPS -DTP2_LIGHT_STAMPS`, globalti
 (pre-cleanup kernel; this kernel in brackets): tables 10.0 -> 3.7 (2.5), consumers at FC1 13.5 -> 4.3 (2.8), first FC1 stage consumed ~14.5 -> 5.9 (4.4),
 FC1 done 25.3 -> 16.7 (15.1; max 27.6 -> 18.3), FC2 done 35.0 -> 25.7 (23.9), exit 36.3 -> 26.9 (25.2; max 39.2 -> 29.2 (27.5)).
 
-- **Block-wide small tables** (`build_tables_small3`, `TP2_SMALL_TABLES_BW`). The one-warp bitmap builder scanned 896 / 32 = 28 experts
+- **Block-wide small tables** (`build_tables_small3`). The one-warp bitmap builder it replaced scanned 896 / 32 = 28 experts
   per lane in unrolled loops: ~12k cycles at M = 1, mostly cold i-cache misses on ~15 KB of straight-line code (6.4 us of the 10 us
   prologue). Now warps 0..7 build the same tables: each thread owns experts tid + 256 r (4 rounds), the 4 rounds' warp scans run together
   with (present, count, padded rows) packed in one word, the (round, warp) sums are prefix-summed by one more warp scan (no serial loop,
-  one barrier), entries and stream-K bounds one per thread. 3.1 us for the whole prologue; `-DTP2_TABLES_CHECK=1` builds both and counts
-  differing table words into `work[3]`.
+  one barrier), entries and stream-K bounds one per thread. 3.1 us for the whole prologue. (A `TP2_TABLES_CHECK` build compared the
+  two builders' tables word for word; the one-warp builders and the check have since been removed.)
 - **Dense mode at M <= 8** (host default `TP2_DENSE_MAXM` 8, env override). Every panel's FC1 B operand is x rows 0..7 by TMA straight from
   xq (OOB rows zero-filled) instead of the grid-wide gather into xg + `xg_cnt` round trips; at M <= 8 every panel is N8 either way, so
   the MMA work is identical. The 3.3 us gather chain between the tables and the first FC1 stage is gone (-2.5 us at M = 1).
@@ -127,12 +127,14 @@ FC1 done 25.3 -> 16.7 (15.1; max 27.6 -> 18.3), FC2 done 35.0 -> 25.7 (23.9), ex
   counter is loaded once at kernel start into smem (pinned load, latency under the table build) instead of by every role after the sync;
   the 4 weight tensor maps are prefetched at kernel start.
 
-Measured and rejected (numbers at M = 1 unless noted): per-row x TMA (`TP2_ROWX` 2: 39.2 vs 38.9); two panel groups (`TP2_GROUPS_MINM=1`:
-38.5); CTA-local quantization (`TP2_LQUANT_MAXM` 2 / 8: +0.3 / +0.4 -- the token flag is hidden under the tables); PDL launch (no
-`launch_dependents` in the kernel: 0); dense epilogue credit in the stream-K cost (`TP2_EPI_SCALE_DENSE` 100 / 200: -0.2 / 0.0, although
-owner CTAs finish FC1 1.5-2 us after non-owners); an early pass issuing 1-7 stages of weight TMAs from the producer warp during the table
-build (`TP2_EARLY_TMA`, it sorts the <= 32 ids itself: +0.8..+1.2 us -- the burst is HBM-bound either way and the queued TMA requests held
-up the producer's `setmaxnreg` after the sync); grabbing the next T1 item ahead (the first CTAs took two items each: +2 us); two or four
+Measured and rejected (numbers at M = 1 unless noted; the compile-time knobs named here were removed from the kernel afterwards, only the
+runtime env `TP2_GROUPS_MINM` / `TP2_DENSE_MAXM` overrides remain): per-row x TMA (was `TP2_ROWX` 2: 39.2 vs 38.9); two panel groups
+(`TP2_GROUPS_MINM=1`: 38.5); CTA-local quantization (was `TP2_LQUANT_MAXM` 2 / 8: +0.3 / +0.4 -- the token flag is hidden under the
+tables); PDL launch (no `launch_dependents` in the kernel: 0); dense epilogue credit in the stream-K cost (was `TP2_EPI_SCALE_DENSE` 100 /
+200: -0.2 / 0.0, although owner CTAs finish FC1 1.5-2 us after non-owners); an early pass issuing 1-7 stages of weight TMAs from the
+producer warp during the table build (was `TP2_EARLY_TMA`, it sorts the <= 32 ids itself: +0.8..+1.2 us -- the burst is HBM-bound either
+way and the queued TMA requests held up the producer's `setmaxnreg` after the sync); grabbing the next T1 item ahead (the first CTAs took
+two items each: +2 us); two or four
 lanes per T1 message (0 at M = 1, +0.6 / +3 us at M = 4 / 8); an out-of-line T1 message warmed up by warp 18 during FC2 (+6 us: the call
 wrecks the register allocation). What remains at M = 1: 1.3 us for the first global load (ids) and ~0.5 us cold-code costs at each phase
 start, FC1 10.8 us (17 k-tiles at 0.65 us: dequant-ALU / handshake bound), the FC1 -> FC2 chain 3.2 us (owner epilogue 0.4, pan_cnt
@@ -330,7 +332,7 @@ $PY pp2.py --layers 2 --ms 1 8 --nexp 32 --colocated --time  # TP8 x PP2 rehears
 
 1. Tail fusion: RMSNorm + W_up K-slice + shared-expert shard + 7168-wide reduce inside the kernel (second LL stage) instead of torch + NCCL.
 2. Sharded router + W_down GEMM with an NVLink all-gather of z (today: torch GEMM + NCCL all-gather).
-3. Small-M latency, next round: the FC1 -> FC2 handoff chain (~3 us at M = 1), the FC1 k-tile handshake rate, dense mode for M <= 32 (then the compact gather path can go); fold the default-on TP2_* knobs into the single path and drop the off-by-default A/B knobs.
+3. Small-M latency, next round: the FC1 -> FC2 handoff chain (~3 us at M = 1), the FC1 k-tile handshake rate, dense mode for M <= 32 (then the compact gather path can go). (The default-on TP2_* knobs are folded into the single path and the off-by-default A/B knobs are gone; what remains are `TP2_STAMPS` / `TP2_LIGHT_STAMPS` instrumentation and the tuned constants `TP2_COST` / `TP2_EPI_COST` / `TP2_EPI_SCALE` / `TP2_DENSE_MAXM` / `TP2_FC2_L2PF` / `TP2_EARLY_XQ_MAXM` / `TP2_PROD_REGS` / `TP2_CONS_REGS` / `TP2_W_L2PROMO`.)
 4. Activation quantization: K3 was trained with MXFP8 (per-32-group) activations; the kernel uses per-token FP8. Evaluate on real weights.
 5. RS + AG tail for M > 32 / larger prefill-ish batches; M * topk > 512 tables.
 6. Engine hook (SGLang / vLLM K3 model) with 46 layers per stage; CUDA-graph the whole stage incl. the hop.

@@ -1,6 +1,6 @@
 // tp8moe: TP8 fused MoE decode kernel for Hopper (sm_90a), Kimi K3 Stable-LatentMoE routed experts (latent 3584 in / out,
 // per-rank intermediate 384, 896 experts, top-16, SiTU-GLU), Humming fused-e8m0 W4A8 weights used in place.  Derived from
-// tp4moe2 (../serving_tp4moe2_v26/tp4moe2_ns.cu), whose k-loop pipeline headers it includes.  One persistent kernel, one CTA
+// tp4moe2 (../serving_tp4moe2_v26/tp4moe2_ns.cu), whose k-loop pipeline header (kpipe.cuh) it includes.  One persistent kernel, one CTA
 // per SM (640 threads: 4 consumer warpgroups + 1 producer warpgroup):
 //   prologue  every CTA builds the same routing tables from (ids, weights): union (ascending expert id), per-expert token
 //             entries (ascending token), token panels of <= 32 entries.  Deterministic, no inter-CTA traffic.  The producer
@@ -24,17 +24,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <string>
 #include <unordered_map>
-#include "chain4.cuh"
 #include "kpipe.cuh"
 
 #ifndef TP2_NS
 #define TP2_NS tp8moe
-#endif
-#ifndef TP2_QUANT_PRE
-#define TP2_QUANT_PRE 0   // (measured neutral) PDL launch + fused quantization: the quantizing threads run before griddepcontrol.wait (x precedes the routing)
-#endif
-#ifndef TP2_GATHER_FENCE
-#define TP2_GATHER_FENCE 0   // 1: consumers fence.proxy.async after an FC1 stage lands (cp.async-written x tile read by wgmma)
 #endif
 
 namespace TP2_NS {
@@ -55,11 +48,7 @@ constexpr int HLB = 1024;                    // one 64-row x k32 Humming block
 constexpr int STAGE_W = 16384, STAGE_S = 1024, STAGE_WS = STAGE_W + STAGE_S;   // [4 k32 slices][4 blocks][1 KB] + [4][4 x 64 B]
 constexpr int STAGE_X = NMAX * 128;          // FC1 x tile: [32 tokens][128 B] (128B swizzle)
 constexpr int STAGE = STAGE_WS + STAGE_X;    // 21504 (multiple of 1024)
-#ifndef TP2_KPS
-#define TP2_KPS 1   // (2 measured slower at every M) k-tiles per ring stage: one full / empty mbarrier round trip per KPS k-tiles; stream-K ranges are KPS-aligned
-#endif
-constexpr int KPS = TP2_KPS;
-constexpr int NST = KPS == 2 ? 6 : 7;        // ring slots (one k-tile each); barrier stages = NST / KPS (slot pairs)
+constexpr int NST = 7;                       // ring stages (one k-tile each: one full / empty mbarrier round trip per k-tile)
 constexpr int OFF_STG = NST * STAGE;         // epilogue staging: FC1 up exchange [2][128][NMAX/2] fp32 + act tile [NMAX][128] bf16 | FC2 out tile [NMAX][256] bf16
 constexpr int ACT_PITCH = 136;                    // act tile row pitch (bf16): 272 B rows, 16 B apart in banks (no 4-way conflicts)
 constexpr int OUT_PITCH = 264;                    // FC2 out tile row pitch (bf16): 528 B rows
@@ -77,16 +66,16 @@ constexpr int TAB_KM = TAB_P2U + MAXP * 2;             // uint16 [MAXE] top-k sl
 constexpr int TAB_E2P = TAB_KM + MAXE * 2;             // uint16 [MAXE] panel of entry
 constexpr int TAB_FS = TAB_E2P + MAXE * 2;             // float [NMAX] per-token epilogue factor
 constexpr int TAB_AM = TAB_FS + NMAX * 4;              // float [NMAX][16] amax partials (per warp)
-constexpr int TAB_MISC = TAB_AM + NMAX * 16 * 4;       // int [32]: 0 U, 1 entries, 2 panels, 3 queued quantizations
+constexpr int TAB_MISC = TAB_AM + NMAX * 16 * 4;       // int [32]: 0 U, 1 entries, 2 panels, 4 first panel of group 1, 6 epoch, 16 T1 item
 constexpr int TAB_CCUM = TAB_MISC + 32 * 4;            // uint32 [MAXP + 1] exclusive FC1 cost prefix over panels
 constexpr int TAB_PROW = TAB_CCUM + (MAXP + 8) * 4;    // uint32 [MAXP + 1] exclusive prefix of padded panel widths (xg rows)
 constexpr int TAB_PINF = TAB_PROW + (MAXP + 8) * 4;    // uint32 [MAXP] panel info: e | n << 8 | ebase << 14
 constexpr int MAXG = 160;
 constexpr int TAB_BND = TAB_PINF + MAXP * 4;           // int [2][MAXG + 1] FC1 stream-K range starts of every CTA, per panel group
 constexpr int TAB_QQ = TAB_BND + (2 * (MAXG + 1) + 6) * 4;   // int [64] scratch: prologue quantization reduction (producer warpgroup), then the producer lane's panel-ready bit set
-constexpr int TAB_UNIT = TAB_QQ + 64 * 4;              // int2 [8] FC2 unit ring (producer -> consumers), int [NRT] units done per row tile, int4 [2] out tile info
-constexpr int NRTP = (NRT + 3) & ~3;                   // NRT padded to a multiple of 4 ints (16-B alignment of the out tile info)
-constexpr int TAB_BAR = TAB_UNIT + (16 + NRTP + 8) * 4; // uint64 full[NST], empty[NST], epi[4], fullo[2], freeo[2], sdone, xsb
+constexpr int TAB_UNIT = TAB_QQ + 64 * 4;              // int2 [8] FC2 unit ring (producer -> consumers), int4 [2] out tile info
+constexpr int TAB_OUTI = TAB_UNIT + 16 * 4;            // the out tile info (rtile, ebase, n) per out tile
+constexpr int TAB_BAR = TAB_UNIT + (16 + 8) * 4;       // uint64 full[NST], empty[NST], epi[4], fullo[2], freeo[2], sdone, xsb
 constexpr int TAB_DBG = TAB_BAR + (2 * NST + 10) * 8;   // TP2_STAMPS: u64 [48] per-CTA stamps / accumulators (flushed at exit)
 constexpr int TAB_XS = TAB_DBG + 48 * 8;                // float [NMAX] dense + fused quantization: per-token x scale (warp 19, xsb)
 constexpr int TAB_BYTES = TAB_XS + NMAX * 4;
@@ -103,10 +92,7 @@ constexpr int k_cost0 = TP2_APPLY(TP2_A0, TP2_COST), k_cost1 = TP2_APPLY(TP2_A1,
 #define TP2_EPI_COST 250, 300, 400, 500                // owner epilogue cost of one FC1 item by width class (same units: 100 = one N8 k-tile)
 #endif
 #ifndef TP2_EPI_SCALE
-#define TP2_EPI_SCALE 300   // percent; compact panels (dense mode: TP2_EPI_SCALE_DENSE)
-#endif
-#ifndef TP2_EPI_SCALE_DENSE
-#define TP2_EPI_SCALE_DENSE 0   // percent: owner epilogue cost credited in the dense stream-K cost model (100 / 200 measured -0.2 / 0.0 us at M = 1)
+#define TP2_EPI_SCALE 300   // percent; compact panels (dense mode credits no epilogue cost: 100 / 200 percent measured -0.2 / 0.0 us at M = 1)
 #endif
 constexpr int k_epi0 = TP2_APPLY(TP2_A0, TP2_EPI_COST), k_epi1 = TP2_APPLY(TP2_A1, TP2_EPI_COST), k_epi2 = TP2_APPLY(TP2_A2, TP2_EPI_COST), k_epi3 = TP2_APPLY(TP2_A3, TP2_EPI_COST);
 __device__ __forceinline__ uint32_t sel4(int cl, int a, int b, int c, int d) { return (uint32_t)(cl == 0 ? a : (cl == 1 ? b : (cl == 2 ? c : d))); }   // immediates, no constant-bank load
@@ -114,20 +100,19 @@ __device__ __forceinline__ uint32_t c_cost(int cl) { return sel4(cl, k_cost0, k_
 // stream-K cost of one panel of width class cl: ITEMS items x (owner epilogue + NKT1 k-tiles); a position x (cost units from the
 // panel start) maps to the item-major k-tile whose range it falls in (the epilogue cost sits before an item's k-tile 0: its owner pays it)
 __device__ __forceinline__ uint32_t c_epi(int cl, bool dense) {
-    return dense ? sel4(cl, k_epi0 * TP2_EPI_SCALE_DENSE / 100, k_epi1 * TP2_EPI_SCALE_DENSE / 100, k_epi2 * TP2_EPI_SCALE_DENSE / 100, k_epi3 * TP2_EPI_SCALE_DENSE / 100)
-                 : sel4(cl, k_epi0 * TP2_EPI_SCALE / 100, k_epi1 * TP2_EPI_SCALE / 100, k_epi2 * TP2_EPI_SCALE / 100, k_epi3 * TP2_EPI_SCALE / 100);
+    return dense ? 0u : sel4(cl, k_epi0 * TP2_EPI_SCALE / 100, k_epi1 * TP2_EPI_SCALE / 100, k_epi2 * TP2_EPI_SCALE / 100, k_epi3 * TP2_EPI_SCALE / 100);
 }
 __device__ __forceinline__ uint32_t panel_cost(int cl, bool dense) { return (uint32_t)ITEMS * (c_epi(cl, dense) + (uint32_t)NKT1 * c_cost(cl)); }
 __device__ __forceinline__ int panel_kt(uint32_t x, int cl, bool dense) {
     const uint32_t e = c_epi(cl, dense), cc = c_cost(cl), ic = e + (uint32_t)NKT1 * cc;
     const uint32_t q = min((uint32_t)ITEMS - 1u, x / ic), y = x - q * ic;
-    return (int)(q * (uint32_t)NKT1 + (y < e ? 0u : min((uint32_t)NKT1 - 1u, (y - e) / cc))) & ~(KPS - 1);   // (KPS-aligned: a ring stage never spans two pieces)
+    return (int)(q * (uint32_t)NKT1 + (y < e ? 0u : min((uint32_t)NKT1 - 1u, (y - e) / cc)));
 }
 constexpr int SMEM_TOTAL = OFF_TAB + TAB_BYTES;
 constexpr int SMEM_ALLOC = SMEM_TOTAL + 1024;
 static_assert(STAGE % 1024 == 0 && OFF_STG % 1024 == 0, "swizzle atoms");
 static_assert(SMEM_ALLOC <= 232448, "smem budget");
-static_assert(TAB_BAR % 8 == 0 && (TAB_UNIT + (16 + NRTP) * 4) % 16 == 0, "mbarrier / int4 alignment");
+static_assert(TAB_BAR % 8 == 0 && TAB_OUTI % 16 == 0, "mbarrier / int4 alignment");
 // prologue scratch (inside the ring, dead before the first TMA)
 constexpr int PRO_BITS = 0;                            // uint32 [NEXP][16] token bits
 constexpr int PRO_PRE = PRO_BITS + NEXP * 16 * 4;      // uint16 [NEXP][16] exclusive word prefix
@@ -141,7 +126,6 @@ constexpr int NSTAMP = 48;   // + 24 last FC1 piece done (consumers) 26 quant do
 
 struct alignas(64) Params {
     CUtensorMap xmap;                        // dense mode: x [M][DIM] e4m3, box {128 B, md rows}, 128B swizzle (OOB rows zero-filled)
-    CUtensorMap xrow;                        // compact panels of <= TP2_ROWX rows: x [M][DIM] e4m3, box {128 B, 1 row}, 128B swizzle
     const CUtensorMap* tmaps;                // [0] w13 5-D, [1] s13 4-D, [2] w2 3-D, [3] s2 3-D
     const float* fc1_s2;
     const float* fc2_s2;
@@ -173,7 +157,7 @@ struct alignas(64) Params {
     __nv_bfloat16* out;                      // [M][DIM] latent sum over the ranks (BF16)
     int M, n_exp, my_rank, ndev;
     int dense, md;                           // dense mode (small M): FC1 B operand = x rows 0..md-1 for every expert, no gather
-    int groups;                              // FC1 panel groups (1 or 2, see TP2_GROUPS): host-chosen by M (TP2_GROUPS_MINM)
+    int groups;                              // FC1 panel groups (1 or 2): host-chosen by M (2 at M >= env TP2_GROUPS_MINM, default 16)
     int pdl_early;                           // PDL launch: 1 = routing tables (ids only) + first weight loads before griddepcontrol.wait
     unsigned long long* dbg;                 // [grid][NSTAMP] globaltimer stamps (TP2_STAMPS builds)
     unsigned long long* tl;                  // [grid][16 units][8] clock64 timeline of the first FC2 units (TP2_STAMPS builds)
@@ -189,7 +173,6 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)_
 __device__ __forceinline__ unsigned long long gtimer() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
 __device__ unsigned long long* dbg_smem();
 #define STAMPT(P, k) do { if ((P).dbg) dbg_smem()[(k)] = gtimer(); } while (0)   // any (single) thread
-#define CKM(P, k) do { if ((P).dbg && threadIdx.x == 0) dbg_smem()[(k)] = clock64(); } while (0)
 #define STAMP(P, k) do { if ((P).dbg && threadIdx.x == 0) dbg_smem()[(k)] = gtimer(); } while (0)
 #ifdef TP2_LIGHT_STAMPS   // phase stamps only (no accumulators / per-unit timeline): least distortion
 #define TSTART(v) do {} while (0)
@@ -203,7 +186,6 @@ __device__ unsigned long long* dbg_smem();
 #else
 #define STAMP(P, k) do {} while (0)
 #define STAMPT(P, k) do {} while (0)
-#define CKM(P, k) do {} while (0)
 #define TSTART(v) do {} while (0)
 #define TACC(P, k, v) do {} while (0)
 #define TL(P, j, k) do {} while (0)
@@ -230,14 +212,6 @@ __device__ __forceinline__ void mbar_arrive(uint64_t* bar) { asm volatile("mbarr
 __device__ __forceinline__ void mbar_arrive_cnt(uint64_t* bar, unsigned n) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0], %1;" :: "r"(smem_u32(bar)), "r"(n) : "memory"); }
 __device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned parity) {
     asm volatile("{\n .reg .pred p;\nW_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra W_%=;\n}\n" :: "r"(smem_u32(bar)), "r"(parity) : "memory");
-}
-__device__ __forceinline__ void tma_acquire_map(const CUtensorMap* map) {
-    asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" :: "l"(reinterpret_cast<uint64_t>(map)) : "memory");
-    asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(map)) : "memory");
-}
-__device__ __forceinline__ void tma_load_2d_row(void* dst, const CUtensorMap* map, int c0, int c1, uint64_t* bar) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
-                 :: "r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(smem_u32(bar)) : "memory");
 }
 __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap* map, int c0, int c1, uint64_t* bar) {
     asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
@@ -272,49 +246,21 @@ __device__ __forceinline__ void tma_prefetch_3d(const CUtensorMap* map, int c0, 
 #define TP2_CONS_REGS 104
 #endif
 static_assert(512 * TP2_CONS_REGS + 128 * TP2_PROD_REGS <= 61440, "register pool");
-#ifndef TP2_CLASS_STATS
-#define TP2_CLASS_STATS 0   // stamps build: per panel-width k-tile counts / times in slots 16..23 (else: prologue sub-stamps 16..21)
-#endif
-#ifndef TP2_GROUPS
-#define TP2_GROUPS 1   // 2: always 2 FC1 panel groups (group 0's h is quantized while group 1's FC1 runs; +2 partial exchanges per CTA); 1: one group below TP2_GROUPS_MINM tokens, 2 above
-#endif
-#ifndef TP2_PIN_LOADS
-#define TP2_PIN_LOADS 1   // epilogue scale loads pinned early (asm volatile) instead of sunk next to their use
-#endif
-#ifndef TP2_SMALL_TABLES
-#define TP2_SMALL_TABLES 2   // M * topk <= 128: one-warp table build (2: expert token bitmaps, 1: bitonic sort) instead of the block-wide chain
-#endif
-#ifndef TP2_SMALL_TABLES_BW
-#define TP2_SMALL_TABLES_BW 1   // small tables (M * topk <= 128) built block-wide by warps 0..7 (build_tables_small3) instead of by one warp
-#endif
-#ifndef TP2_TABLES_CHECK
-#define TP2_TABLES_CHECK 0   // diagnostic: build the one-warp tables too and count differing table words into work[3]
-#endif
 #ifndef TP2_DENSE_MAXM
 #define TP2_DENSE_MAXM 8   // M <= this: dense mode (every panel's FC1 B operand = x rows 0..md-1 by TMA straight from xq: no grid-wide x gather / xg_cnt
                            // round trips; one N8 instantiation at M <= 8 either way).  Env TP2_DENSE_MAXM overrides.  Measured -1.5..-2.5 us at M 1..8.
 #endif
-#ifndef TP2_EARLY_MAP_PF
-#define TP2_EARLY_MAP_PF 1   // producer lane prefetches the 4 weight tensor maps at kernel start (not after the tables)
-#endif
-#ifndef TP2_T1_ONE_GRAB
-#define TP2_T1_ONE_GRAB 1   // T1 queue (TP2_T1_DYN) with <= G items: one grab per CTA (no second grab round trip before the exit).  (Grabbing the
-                            // next item ahead of the current one was measured worse: the first CTAs take two items each and serialize them.)
-#endif
-#ifndef TP2_EARLY_DONE
-#define TP2_EARLY_DONE 1   // the CTA-done atomic is issued before the tail (its return consumed after it) instead of right before the exit
-#endif
-#ifndef TP2_EARLY_EPOCH
-#define TP2_EARLY_EPOCH 1   // the epoch counter is loaded once at kernel start (thread 0 -> smem) instead of by every role after the __syncthreads
-#endif
 #ifndef TP2_FC2_L2PF
 #define TP2_FC2_L2PF 4   // FC2 units per CTA whose weights the TMA lane L2-prefetches right after issuing its last FC1 tile
+#endif
+#ifndef TP2_EARLY_XQ_MAXM
+#define TP2_EARLY_XQ_MAXM 64   // compact panels: the producer warpgroup acquires every token flag in the prologue up to this M (M 128: +1.5..2.5 us --
+                               // the late flags hold the __syncthreads and with it the pass-A weight loads)
 #endif
 // programmatic dependent launch: everything that reads the previous kernels' outputs (x, xs, shared, routing weights) or this
 // kernel's own global workspace (epoch, counters -- the previous launch of this kernel may be the prerequisite grid) follows it
 __device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void named_bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
-__device__ __forceinline__ void named_bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 __device__ __forceinline__ unsigned ld_acquire_gpu(const unsigned* p) { unsigned v; asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
 __device__ __forceinline__ unsigned ld_relaxed_gpu(const unsigned* p) { unsigned v; asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
 // spin with relaxed loads (an ld.acquire per poll invalidates L1 each time: CCTL.IVALL), one acquire fence once satisfied
@@ -351,124 +297,28 @@ template <int N> __device__ __forceinline__ void fence_operand(float (&r)[N]) {
 __device__ __forceinline__ uint64_t make_desc_sw128(uint32_t a) {   // K-major 128B-swizzled tile: 8-row atoms of 1 KB (SBO 1024)
     return (uint64_t)((a & 0x3FFFF) >> 4) | ((uint64_t)1 << 16) | ((uint64_t)(1024 >> 4) << 32) | ((uint64_t)1 << 62);
 }
-__device__ __forceinline__ void wg_fence() { asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory"); }
-__device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory"); }
 __device__ __forceinline__ void wg_wait0() { asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory"); }
 template <int N> __device__ __forceinline__ void setmaxnreg_inc() { asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(N)); }
 template <int N> __device__ __forceinline__ void setmaxnreg_dec() { asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(N)); }
 
-// ---- MXFP4 -> e4m3 register dequant (Humming fused-e8m0 layout, prmt-based) ----
-__device__ __forceinline__ void make_pools(uint32_t o, uint32_t& lo, uint32_t& hi) {
-    lo = 0x0C080000u + o * 0x08080800u;   // codes 0..3 -> {0, 0.5, 1, 1.5} * 2^(o-6) as e4m3 bytes
-    hi = 0x1C181410u + o * 0x08080808u;   // codes 4..7 -> {2, 3, 4, 6} * 2^(o-6)
-}
-__device__ __forceinline__ void dequant_word(uint32_t q, uint32_t lo, uint32_t hi, uint32_t& w_lo, uint32_t& w_hi) {
-    uint32_t mag_lo, mag_hi;
-    asm volatile("{ .reg .b32 sel, sel_hi, ml, mh;\n"
-                 "and.b32 sel, %2, 0x77777777;\n"
-                 "shr.u32 sel_hi, sel, 16;\n"
-                 "prmt.b32 ml, %3, %4, sel;\n"
-                 "prmt.b32 mh, %3, %4, sel_hi;\n"
-                 "mov.b32 %0, ml; mov.b32 %1, mh; }"
-                 : "=r"(mag_lo), "=r"(mag_hi) : "r"(q), "r"(lo), "r"(hi));
-    w_lo = ((q << 4) & 0x80808080u) | mag_lo;
-    w_hi = (q & 0x80808080u) | mag_hi;
-}
-// 4 k32 slices of this warpgroup's 64-row block: A[s] = m64k32 e4m3 A fragment of slice s (slices 4 KB / 256 B apart)
-__device__ __forceinline__ void dequant_slices4(const uint8_t* frag, const uint8_t* scl, uint32_t (&A)[4][4]) {
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-        const uint32_t o_a = scl[s * 256], o_b = scl[s * 256 + 1];
-        uint32_t lo_a, hi_a, lo_b, hi_b;
-        make_pools(o_a, lo_a, hi_a);
-        make_pools(o_b, lo_b, hi_b);
-        const uint2 q = *reinterpret_cast<const uint2*>(frag + s * 4096);
-        dequant_word(q.x, lo_a, hi_a, A[s][0], A[s][2]);
-        dequant_word(q.y, lo_b, hi_b, A[s][1], A[s][3]);
-    }
-}
-
-// One k-tile: wait the stage, dequant into A, retire the previous chain (D += C, release its stage), issue this chain.
-#ifndef TP2_ROWX
-#define TP2_ROWX 0   // (8 measured much slower: small TMAs clog the TMA unit) compact panels of <= this many rows load x by per-row TMA instead of the gathered xg
-#endif
-#ifndef TP2_FC2_DEFER
-#define TP2_FC2_DEFER 0   // (1 measured 1-2 us slower) FC2 epilogue of unit j stored after unit j + 1's first k-step (fc2_flush)
-#endif
-#ifndef TP2_HF_PREFETCH
-#define TP2_HF_PREFETCH 0   // (1 measured slower: no wait reduction) FC2 producer: acquire-load the next unit's panel flag early (see flag_prefetch)
-#endif
-#ifndef TP2_T1_DYN
-#define TP2_T1_DYN 1   // T1 items (row tile, 8 tokens) from a queue in row-tile order (rt_cnt counted per unit by the store warps): the
-                       // CTAs leaving FC2 first reduce the row tiles already complete instead of all waiting for the last one
-#endif
-#ifndef TP2_EARLY_XS
-#define TP2_EARLY_XS 1   // dense + fused quantization: warp 19 acquires the token flags (+ stages the owners' scales) during the prologue, so
-                         // the producer issues stage 0's x right behind its weights (no flag round trip after the tables)
-#endif
-#ifndef TP2_EARLY_XQ
-#define TP2_EARLY_XQ 1   // compact panels + fused quantization: the producer warpgroup acquires every token flag during the prologue (after
-                         // its own quantization), so the consumers start the x gather right after the __syncthreads (no flag round trip)
-#endif
-#ifndef TP2_EARLY_XQ_MAXM
-#define TP2_EARLY_XQ_MAXM 64   // (M 128: +1.5..2.5 us -- the late flags hold the __syncthreads and with it the pass-A weight loads)
-#endif
-#ifndef TP2_FC2_STAGGER
-#define TP2_FC2_STAGGER 0   // cycles: consumer warpgroups 2, 3 enter the FC2 unit loop this much later than 0, 1 (once, after the first unit's
-                            // stage landed) so one pair's per-unit drain / epilogue / restart overlaps the other pair's k-steps
-#endif
-#ifndef TP2_FC2_STAGGER_MINM
-#define TP2_FC2_STAGGER_MINM 16
-#endif
-#ifndef TP2_STREAM_TAIL
-#define TP2_STREAM_TAIL 0   // (1 measured much slower at M >= 32: warp-18 ALU slows the RS-wgmma k-loops) T1 by warp 18 during FC2 (row tile by row tile, rt_cnt counted per unit by the store warps)
-#endif
-#ifndef TP2_REL_FENCES
-#define TP2_REL_FENCES 0   // 1: the release helper's explicit fence.acq_rel around the panel count / h flag instead of the acq_rel atomic
-#endif
-#ifndef TP2_MAP_FENCE
-#define TP2_MAP_FENCE 0   // 1: fence.proxy.tensormap acquire before the first use of each weight map
-#endif
-#ifndef TP2_KPIPE
-#define TP2_KPIPE 1   // k-steps: dequant of k32 slice j + 1 under the wgmma of slice j (kpipe.cuh, one asm block; bit-identical)
-#endif
+// One k-tile: wait the stage, then one asm block (kpipe.cuh) dequants the 4 k32 slices (slice j + 1 under the wgmma of slice j),
+// retires the previous chain (D += C, releases its stage) and issues this chain.
 template <int N, bool FIRST>
 __device__ __forceinline__ void kstep(uint8_t* smem, uint64_t* full, uint64_t* empty, int& s, unsigned& ph, int& sprev,
-                                      uint32_t (&A)[4][4], float (&C)[N / 2], float (&D)[N / 2], uint64_t desc,
-                                      int frag_off, int scl_off, int lane, bool gather_fence) {
+                                      float (&C)[N / 2], float (&D)[N / 2], uint64_t desc, int frag_off, int scl_off, int lane) {
 #if defined(TP2_STAMPS) && defined(TP2_TL_FC1)
     const int tl_j = g_tl_j; const bool tl_on = threadIdx.x == 0 && g_tl_fc1;
     if (tl_on) TL1(tl_j, 0);
 #endif
-    const bool sub0 = KPS == 1 || (s & (KPS - 1)) == 0;   // first k-tile of its ring stage: wait for the stage, release the previous one
-    if (sub0) mbar_wait(&full[s / KPS], ph);
+    mbar_wait(&full[s], ph);
 #if defined(TP2_STAMPS) && defined(TP2_TL_FC1)
     if (tl_on) TL1(tl_j, 1);
 #endif
-    if (TP2_GATHER_FENCE && gather_fence) fence_proxy_async_smem();
     const uint8_t* st = smem + s * STAGE;
-    if constexpr (TP2_KPIPE) {   // slice-pipelined dequant + wgmma in one asm block (kpipe.cuh)
-        kpipe::KPipe<N, FIRST>::run(C, D, smem_u32(st + frag_off), smem_u32(st + scl_off), desc, smem_u32(&empty[sprev / KPS]), lane == 0 && sub0 ? 1u : 0u);
+    kpipe::KPipe<N, FIRST>::run(C, D, smem_u32(st + frag_off), smem_u32(st + scl_off), desc, smem_u32(&empty[sprev]), lane == 0 ? 1u : 0u);
 #if defined(TP2_STAMPS) && defined(TP2_TL_FC1)
-        if (tl_on) { TL1(tl_j, 2); g_tl_j = tl_j + 1; }
+    if (tl_on) { TL1(tl_j, 2); g_tl_j = tl_j + 1; }
 #endif
-        sprev = s;
-        if (++s == NST) { s = 0; ph ^= 1; }
-        return;
-    }
-    dequant_slices4(st + frag_off, st + scl_off, A);
-    wg_wait0();
-    fence_operand(C);
-    if constexpr (!FIRST) {
-        if (lane == 0 && sub0) mbar_arrive(&empty[sprev / KPS]);
-#pragma unroll
-        for (int i = 0; i < N / 2; ++i) D[i] += C[i];
-    }
-    fence_operand(D);
-    fence_operand(C);
-    wg_fence();
-    chain::Chain<N>::run(C, A, desc);
-    wg_commit();
     sprev = s;
     if (++s == NST) { s = 0; ph ^= 1; }
 }
@@ -476,7 +326,7 @@ template <int N>
 __device__ __forceinline__ void kfinish(uint64_t* empty, int sprev, float (&C)[N / 2], float (&D)[N / 2], int lane) {
     wg_wait0();
     fence_operand(C);
-    if (lane == 0) mbar_arrive(&empty[sprev / KPS]);   // (pieces / units end on a stage's last k-tile)
+    if (lane == 0) mbar_arrive(&empty[sprev]);
 #pragma unroll
     for (int i = 0; i < N / 2; ++i) D[i] += C[i];
     fence_operand(D);
@@ -498,271 +348,13 @@ __device__ __forceinline__ Tabs tabs(uint8_t* smem) {
 }
 // Every CTA: union = present experts in ascending id; entries of an expert = its tokens in ascending order (a token listing the
 // same expert in several slots is ONE entry; FC2 writes its output to every such slot); panels of <= NMAX entries.
-// Small-M tables (M * topk <= 128, top-k <= 16, M <= 128): warp 0 alone, warp-synchronous -- bitonic sort of the (expert, token,
-// slot) keys (4 per lane), then prefix counts by ballot.  Produces exactly the tables of build_tables (one panel per expert:
-// n <= M <= NMAX here).  The caller's __syncthreads publishes them.
-__device__ __forceinline__ void build_tables_small(const Params& P, uint8_t* smem, const Tabs& T) {
-    const int lane = threadIdx.x & 31;
-    const int M = P.M, topk = P.topk, MT = M * topk;
-    uint32_t v[4];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int p = lane + 32 * q;
-        uint32_t key = 0xFFFFFFFFu;
-        if (p < MT) {
-            const int e = __ldcg(P.ids + p), t = p / topk, k = p - t * topk;
-            const bool ok = (unsigned)e < (unsigned)P.n_exp;
-            T.ids[t * TOPK_MAX + k] = ok ? (uint16_t)e : (uint16_t)0xFFFF;
-            if (ok) key = ((uint32_t)e << 11) | ((uint32_t)t << 4) | (uint32_t)k;
-        }
-        v[q] = key;
-    }
-    STAMP(P, 16);
-    for (int i = lane; i < M * TOPK_MAX; i += 32) if ((i & (TOPK_MAX - 1)) >= topk) T.ids[i] = (uint16_t)0xFFFF;   // row padding
-    for (int i = lane; i < (MT + 1) / 2; i += 32) reinterpret_cast<unsigned*>(T.km)[i] = 0u;
-    __syncwarp();
-    STAMP(P, 17);
-    // bitonic sort, element index i = lane + 32 q, ascending
-#pragma unroll
-    for (int k = 2; k <= 128; k <<= 1) {
-#pragma unroll
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            if (j >= 32) {
-#pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    const int qq = q ^ (j >> 5);
-                    if (qq > q) {
-                        const int i = lane + 32 * q;
-                        const uint32_t a = v[q], b2 = v[qq], lo = min(a, b2), hi = max(a, b2);
-                        const bool asc = (i & k) == 0;
-                        v[q] = asc ? lo : hi; v[qq] = asc ? hi : lo;
-                    }
-                }
-            } else {
-#pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    const int i = lane + 32 * q;
-                    const uint32_t o = __shfl_xor_sync(0xffffffffu, v[q], j);
-                    const bool asc = (i & k) == 0, lower = (i & j) == 0;
-                    v[q] = (asc == lower) ? min(v[q], o) : max(v[q], o);
-                }
-            }
-        }
-    }
-    STAMP(P, 18);
-    // run structure: previous element (i - 1) of each element
-    uint32_t prev[4];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const uint32_t up = __shfl_up_sync(0xffffffffu, v[q], 1);
-        const uint32_t last_prev_q = __shfl_sync(0xffffffffu, q ? v[q - 1] : 0xFFFFFFFFu, 31);
-        prev[q] = lane ? up : (q ? last_prev_q : 0xFFFFFFFFu);
-    }
-    unsigned ent_before = 0, head_before = 0;   // exclusive prefixes over elements of earlier q blocks
-    int ent_idx[4], slot_idx[4];
-    bool isent[4], ishead[4];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const bool valid = v[q] != 0xFFFFFFFFu;
-        const bool samet = valid && prev[q] != 0xFFFFFFFFu && (prev[q] >> 4) == (v[q] >> 4);   // same (expert, token): duplicate slot
-        const bool newe = valid && (prev[q] == 0xFFFFFFFFu || (prev[q] >> 11) != (v[q] >> 11));
-        isent[q] = valid && !samet; ishead[q] = newe;
-        const unsigned be = __ballot_sync(0xffffffffu, isent[q]), bh = __ballot_sync(0xffffffffu, newe);
-        const unsigned below = (1u << lane) - 1u;
-        ent_idx[q] = (int)(ent_before + __popc(be & below)) - (isent[q] ? 0 : 1);   // a duplicate maps to its run's entry
-        slot_idx[q] = (int)(head_before + __popc(bh & below)) + (newe ? 0 : -1);
-        ent_before += __popc(be); head_before += __popc(bh);
-    }
-    const int E_tot = (int)ent_before, U = (int)head_before;
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        if (v[q] == 0xFFFFFFFFu) continue;
-        const int e = (int)(v[q] >> 11), t = (int)((v[q] >> 4) & 127u), k = (int)(v[q] & 15u);
-        if (isent[q]) { T.ent[ent_idx[q]] = (uint16_t)t; T.e2p[ent_idx[q]] = (uint16_t)slot_idx[q]; }
-        atomicOr(reinterpret_cast<unsigned*>(T.km + (ent_idx[q] & ~1)), (1u << k) << ((ent_idx[q] & 1) * 16));
-        if (ishead[q]) { T.uexp[slot_idx[q]] = (uint16_t)e; T.off[slot_idx[q]] = (uint16_t)ent_idx[q]; T.pid[slot_idx[q]] = (uint16_t)slot_idx[q]; T.p2u[slot_idx[q]] = (uint16_t)slot_idx[q]; }
-    }
-    if (lane == 0) { T.off[U] = (uint16_t)E_tot; T.pid[U] = (uint16_t)U; T.misc[0] = U; T.misc[1] = E_tot; T.misc[2] = U; T.misc[4] = U; }
-    __syncwarp();
-    STAMP(P, 19);
-    // panels (= slots): info, cost / padded-row prefixes (4 per lane), totals at index U
-    uint32_t c[4], np[4];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int u = lane * 4 + q;   // consecutive panels per lane -> one warp scan of lane sums
-        c[q] = 0; np[q] = 0;
-        if (u < U) {
-            const int o = T.off[u], n = (int)T.off[u + 1] - o;
-            T.pinf[u] = (uint32_t)T.uexp[u] | ((uint32_t)n << 10) | ((uint32_t)o << 16);
-            const int nb = P.dense ? P.md : n;
-            c[q] = panel_cost((nb + 7) / 8 - 1, P.dense);
-            np[q] = (uint32_t)((n + 7) & ~7);
-        }
-    }
-    uint32_t sc = c[0] + c[1] + c[2] + c[3], sn = np[0] + np[1] + np[2] + np[3], ic = sc, in = sn;
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        const uint32_t y = __shfl_up_sync(0xffffffffu, ic, o), z = __shfl_up_sync(0xffffffffu, in, o);
-        if (lane >= o) { ic += y; in += z; }
-    }
-    uint32_t bc = ic - sc, bn = in - sn;
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int u = lane * 4 + q;
-        if (u <= U) { T.ccum[u] = bc; T.prow[u] = bn; }
-        bc += c[q]; bn += np[q];
-    }
-    if (lane == 31) { T.ccum[U] = ic; T.prow[U] = in; }   // totals (also for U == 128)
-    __syncwarp();
-    STAMP(P, 20);
-    // stream-K range starts (group 0 = all panels; group 1 empty): only the window this CTA reads -- its own range and the
-    // starts of the CTAs whose partials it may add (an item spans <= 32 CTAs: every CTA has >= 1 k-tile of the >= 128)
-    {
-        const unsigned G = gridDim.x, total = T.ccum[U];
-        const int ncl = P.dense ? (P.md + 7) / 8 - 1 : -1;
-        for (unsigned b = blockIdx.x + lane; b <= min(G, blockIdx.x + 33u); b += 32) {
-            int r;
-            if (b == 0) r = 0;
-            else if (b == G || U == 0) r = U * ITEMS * NKT1;
-            else {
-                const unsigned bcst = (total * b) / G;
-                int lo = 0, hi = U - 1;
-                while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (T.ccum[mid] <= bcst) lo = mid; else hi = mid - 1; }
-                const int cl = ncl >= 0 ? ncl : (int)((((T.pinf[lo] >> 10) & 63u) + 7u) / 8u) - 1;
-                r = lo * ITEMS * NKT1 + panel_kt(bcst - T.ccum[lo], cl, P.dense);
-            }
-            T.bnd[b] = r;
-            T.bnd[MAXG + 1 + b] = U * ITEMS * NKT1;
-        }
-    }
-    STAMP(P, 21);
-}
-
-// Small-M tables, bitmap form (TP2_SMALL_TABLES 2): warp 0 alone.  Per expert a token bitmask (M <= 32) built with shared
-// atomicOr; a warp scan over the NEXP experts (EPL per lane, ascending) gives union slots, entry offsets and the cost prefix; entries
-// are the set bits in ascending token order.  Same tables as build_tables_small (one panel per expert).
-__device__ __forceinline__ void build_tables_small2(const Params& P, uint8_t* smem, const Tabs& T) {
-    const int lane = threadIdx.x & 31;
-    const int M = P.M, topk = P.topk, MT = M * topk;
-    uint32_t* tm = reinterpret_cast<uint32_t*>(smem + PRO_BITS);    // [NEXP] token mask per expert
-    int* eoff = reinterpret_cast<int*>(smem + PRO_OFFE);             // [NEXP] entry offset of expert (valid if present)
-    int* eslot = reinterpret_cast<int*>(smem + PRO_PIDE);            // [NEXP] union slot (= panel) of expert
-#pragma unroll
-    for (int i = 0; i < NEXP / 32; ++i) tm[lane + 32 * i] = 0u;
-    int ev[4];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) { const int p = lane + 32 * q; ev[q] = p < MT ? __ldcg(P.ids + p) : -1; }
-    STAMP(P, 16);
-    for (int i = lane; i < M * TOPK_MAX; i += 32) if ((i & (TOPK_MAX - 1)) >= topk) T.ids[i] = (uint16_t)0xFFFF;   // row padding
-    for (int i = lane; i < (MT + 1) / 2; i += 32) reinterpret_cast<unsigned*>(T.km)[i] = 0u;
-    __syncwarp();
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int p = lane + 32 * q;
-        if (p < MT) {
-            const int e = ev[q], t = p / topk, k = p - t * topk;
-            const bool ok = (unsigned)e < (unsigned)P.n_exp;
-            T.ids[t * TOPK_MAX + k] = ok ? (uint16_t)e : (uint16_t)0xFFFF;
-            if (ok) atomicOr(tm + e, 1u << t);
-            else ev[q] = -1;
-        }
-    }
-    __syncwarp();
-    STAMP(P, 17);
-    CKM(P, 32);
-    // experts lane * 8 .. + 7: counts, presence, panel costs / padded widths
-    constexpr int EPL = NEXP / 32;   // experts per lane
-    uint32_t m[EPL];
-    int cnt = 0, pres = 0;
-    uint32_t cst = 0, npd = 0;
-    const uint32_t dpc = P.dense ? panel_cost((P.md + 7) / 8 - 1, true) : 0u;   // dense: every panel costs the same
-#pragma unroll
-    for (int i = 0; i < EPL; ++i) m[i] = tm[lane * EPL + i];
-#pragma unroll
-    for (int i = 0; i < EPL; ++i) {
-        const int n = __popc(m[i]);
-        cnt += n; pres += n > 0;
-        if (n) { cst += P.dense ? dpc : panel_cost((n + 7) / 8 - 1, false); npd += (uint32_t)((n + 7) & ~7); }
-    }
-    int ic = cnt, ip = pres;
-    uint32_t icst = cst, inp = npd;
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        const int y0 = __shfl_up_sync(0xffffffffu, ic, o), y1 = __shfl_up_sync(0xffffffffu, ip, o);
-        const uint32_t y2 = __shfl_up_sync(0xffffffffu, icst, o), y3 = __shfl_up_sync(0xffffffffu, inp, o);
-        if (lane >= o) { ic += y0; ip += y1; icst += y2; inp += y3; }
-    }
-    CKM(P, 33);
-    int E = ic - cnt, u = ip - pres;
-    uint32_t cc = icst - cst, nn = inp - npd;
-    const int E_tot = __shfl_sync(0xffffffffu, ic, 31), U = __shfl_sync(0xffffffffu, ip, 31);
-#pragma unroll
-    for (int i = 0; i < EPL; ++i) {
-        const int n = __popc(m[i]);
-        if (!n) continue;
-        const int e = lane * EPL + i;
-        T.uexp[u] = (uint16_t)e; T.off[u] = (uint16_t)E; T.pid[u] = (uint16_t)u; T.p2u[u] = (uint16_t)u;
-        T.pinf[u] = (uint32_t)e | ((uint32_t)n << 10) | ((uint32_t)E << 16);
-        T.ccum[u] = cc; T.prow[u] = nn;
-        eoff[e] = E; eslot[e] = u;
-        cc += P.dense ? dpc : panel_cost((n + 7) / 8 - 1, false); nn += (uint32_t)((n + 7) & ~7);
-        E += n; ++u;
-    }
-    CKM(P, 34);
-    if (lane == 31) {
-        T.off[U] = (uint16_t)E_tot; T.pid[U] = (uint16_t)U; T.misc[0] = U; T.misc[1] = E_tot; T.misc[2] = U; T.misc[4] = U;
-        T.ccum[U] = cc; T.prow[U] = nn;
-    }
-    __syncwarp();
-    // entries (rank of the token in its expert's mask) and their slot masks, one id per lane-step (a duplicate expert in several
-    // slots of a token: one entry -- written twice with the same values -- and several km bits)
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int p = lane + 32 * q;
-        if (p < MT && ev[q] >= 0) {
-            const int e = ev[q], t = p / topk, k = p - t * topk;
-            const int ent = eoff[e] + __popc(tm[e] & ((1u << t) - 1u));
-            T.ent[ent] = (uint16_t)t; T.e2p[ent] = (uint16_t)eslot[e];
-            atomicOr(reinterpret_cast<unsigned*>(T.km + (ent & ~1)), (1u << k) << ((ent & 1) * 16));
-        }
-    }
-    __syncwarp();
-    CKM(P, 35);
-    STAMP(P, 20);
-    if (P.dense) {   // uniform panel cost, no epilogue term: CTA b starts at k-tile floor(U * ITEMS * NKT1 * b / G) (= the general form)
-        const unsigned G = gridDim.x;
-        for (unsigned b = blockIdx.x + lane; b <= min(G, blockIdx.x + 33u); b += 32) {
-            T.bnd[b] = (int)(((unsigned)U * (unsigned)ITEMS * NKT1 * b) / G) & ~(KPS - 1);
-            T.bnd[MAXG + 1 + b] = U * ITEMS * NKT1;
-        }
-    } else {   // stream-K range starts: this CTA's window (as build_tables_small)
-        const unsigned G = gridDim.x, total = T.ccum[U];
-        for (unsigned b = blockIdx.x + lane; b <= min(G, blockIdx.x + 33u); b += 32) {
-            int r;
-            if (b == 0) r = 0;
-            else if (b == G || U == 0) r = U * ITEMS * NKT1;
-            else {
-                const unsigned bcst = (total * b) / G;
-                int lo = 0, hi = U - 1;
-                while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (T.ccum[mid] <= bcst) lo = mid; else hi = mid - 1; }
-                const int cl = (int)((((T.pinf[lo] >> 10) & 63u) + 7u) / 8u) - 1;
-                r = lo * ITEMS * NKT1 + panel_kt(bcst - T.ccum[lo], cl, false);
-            }
-            T.bnd[b] = r;
-            T.bnd[MAXG + 1 + b] = U * ITEMS * NKT1;
-        }
-    }
-    CKM(P, 36);
-    STAMP(P, 21);
-}
-
-// Small-M tables, block-wide bitmap form (TP2_SMALL_TABLES_BW): warps 0..7 (256 threads, named barrier 2; warps 8..15 quantize x
-// meanwhile).  Same tables as build_tables_small2, bit for bit.  The one-warp builder scans NEXP / 32 = 28 experts per lane in
-// unrolled loops (~12k cycles at M = 1, mostly cold i-cache misses on ~15 KB of straight-line code); here each thread owns the
-// experts tid + 256 r (4 rounds), the 4 rounds' warp scans are issued together (one barrier for all of them: the scan values are
-// known from the bitmaps), the per-round / per-warp sums are combined by every thread, and there is no 28-way unrolled loop.
+// Small-M tables (M * topk <= 128, M <= NMAX): warps 0..7 (256 threads, named barrier 2; warps 8..15 quantize x meanwhile).  Per
+// expert a token bitmask built with shared atomicOr; each thread owns the experts tid + 256 r (4 rounds), the 4 rounds' warp scans are
+// issued together (one barrier for all of them: the scan values are known from the bitmaps), the per-round / per-warp sums are
+// combined by every thread (no serial loop), entries (the set bits in ascending token order) and stream-K bounds one per thread.
 // (pres, count, padded rows) travel packed in one scan word: the totals are bounded by the entries (U, E_tot <= MT <= 128: 8 bits each;
-// padded rows <= E_tot + 7 U <= 1024: 11 bits).
+// padded rows <= E_tot + 7 U <= 1024: 11 bits).  Produces exactly the tables of build_tables (one panel per expert: n <= M <= NMAX
+// here).  The caller's __syncthreads publishes them.
 __device__ __forceinline__ void build_tables_small3(const Params& P, uint8_t* smem, const Tabs& T) {
     constexpr int BT = 256, NR = (NEXP + BT - 1) / BT;   // 4 rounds of 256 experts
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -849,11 +441,12 @@ __device__ __forceinline__ void build_tables_small3(const Params& P, uint8_t* sm
         T.ent[ent] = (uint16_t)t; T.e2p[ent] = (uint16_t)eslot[e_id];
         atomicOr(reinterpret_cast<unsigned*>(T.km + (ent & ~1)), (1u << k) << ((ent & 1) * 16));
     }
-    {   // stream-K range starts: this CTA's window (as build_tables_small2), one CTA boundary per thread
+    {   // stream-K range starts, one CTA boundary per thread: only the window this CTA reads -- its own range and the starts of the
+        // CTAs whose partials it may add (an item spans <= 32 CTAs: every CTA has >= 1 k-tile of the >= 128)
         const unsigned G = gridDim.x, b = blockIdx.x + (unsigned)tid;
         if (tid < 34 && b <= G) {
             int r;
-            if (P.dense) r = (int)(((unsigned)U * (unsigned)ITEMS * NKT1 * b) / G) & ~(KPS - 1);   // uniform panel cost, no epilogue term
+            if (P.dense) r = (int)(((unsigned)U * (unsigned)ITEMS * NKT1 * b) / G);   // uniform panel cost, no epilogue term
             else if (b == 0) r = 0;
             else if (b == G || U == 0) r = U * ITEMS * NKT1;
             else {
@@ -987,7 +580,7 @@ __device__ __forceinline__ void build_tables(const Params& P, uint8_t* smem, con
         if (tid <= P_tot) { T.ccum[tid] = base + a - c; T.prow[tid] = based + d - np; }   // tid == P_tot: c == np == 0 -> totals
         named_bar_sync(1, BT);
     }
-    // panel groups: group 0 = panels starting before the cost midpoint (TP2_GROUPS 2), group 1 = the rest
+    // panel groups: group 0 = panels starting before the cost midpoint (P.groups == 2), group 1 = the rest
     {
         const unsigned total = T.ccum[P_tot];
         if (tid == 0 && (P.groups == 1 || P_tot <= 1)) T.misc[4] = P_tot;   // else exactly one panel thread writes the split below
@@ -1117,11 +710,6 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
     const int G = gridDim.x, b = blockIdx.x;
     const int P_tot = T.misc[2];
     int s = 0; unsigned ph = 0;
-    // the maps were written by a host copy before this launch: no tensormap-proxy acquire fence needed, just the prefetch
-    for (int i = 0; i < 4; ++i) {
-        if (TP2_MAP_FENCE) tma_acquire_map(P.tmaps + i);
-        else if (!TP2_EARLY_MAP_PF) asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(P.tmaps + i)) : "memory");
-    }
     // pass A: weights of the first <= NST FC1 stages (no dependency on the x gather / the previous kernels)
     int nA = 0;
     int kts[NST];
@@ -1130,12 +718,12 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
     for (int gk = lo; gk < hi && nA < NST;) {
         const int it = gk / NKT1, kt0 = gk % NKT1, kt1 = min(NKT1, hi - (it * NKT1));
         const Item I = item_of(T, it / ITEMS, it % ITEMS);
-        const int np = P.dense ? P.md : (I.n <= TP2_ROWX ? I.n : (I.n + 7) & ~7);   // row mode: only the panel's n rows are loaded
+        const int np = P.dense ? P.md : (I.n + 7) & ~7;
         for (int kt = kt0; kt < kt1 && nA < NST; ++kt, ++nA) {
             uint8_t* st = smem + nA * STAGE;
             TL1(nA, 3);
             if (nA == 0) STAMPT(P, 38);   // (stamps) stage 0 weights issued
-            if ((nA & (KPS - 1)) == 0) mbar_arrive_expect_tx(&full[nA / KPS], (unsigned)(KPS * (STAGE_WS + np * 128)));   // (a stage = KPS k-tiles of one item)
+            mbar_arrive_expect_tx(&full[nA], (unsigned)(STAGE_WS + np * 128));
             const int row = I.e * (NKT1 * 4) + kt * 4;
             if (P.dense && nA == 1) {   // the TMA unit works in issue order: stage 0's x goes right behind its weights
                 griddep_wait();          // (PDL: the previous kernel -- shorter than the table build -- has usually finished)
@@ -1146,10 +734,10 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
                 STAMPT(P, 39);   // (stamps) dense: x of stage 0 issued
                 TL1(0, 5); tma_load_2d(smem + STAGE_WS, &P.xmap, kts[0] * 128, 0, &full[0]);
             }
-            tma_load_5d(st, P.tmaps + 0, 0, 0, I.q, 0, row, &full[nA / KPS]);
-            tma_load_4d(st + STAGE_W, P.tmaps + 1, 0, I.q, 0, row, &full[nA / KPS]);
+            tma_load_5d(st, P.tmaps + 0, 0, 0, I.q, 0, row, &full[nA]);
+            tma_load_4d(st + STAGE_W, P.tmaps + 1, 0, I.q, 0, row, &full[nA]);
             kts[nA] = kt;
-            if (P.dense && nA > 0) { TL1(nA, 5); tma_load_2d(st + STAGE_WS, &P.xmap, kt * 128, 0, &full[nA / KPS]); }
+            if (P.dense && nA > 0) { TL1(nA, 5); tma_load_2d(st + STAGE_WS, &P.xmap, kt * 128, 0, &full[nA]); }
         }
         gk = (it + 1) * NKT1;
     }
@@ -1160,45 +748,37 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
         else wait_tokens(P, 0, 1);
     }   // (dense with nA >= 2 waited above; compact panels read xg -- gathered after the wait)
     if (P.dense && nA == 1) { TL1(0, 5); tma_load_2d(smem + STAGE_WS, &P.xmap, kts[0] * 128, 0, &full[0]); }
-    const unsigned epoch = (TP2_EARLY_EPOCH ? (unsigned)T.misc[6] : __ldcg(P.work)) + 1u, par = epoch & 1u;
+    const unsigned epoch = (unsigned)T.misc[6] + 1u, par = epoch & 1u;
     int n = 0, ready_pid = -1;
-    bool rows_ok = false;
     const unsigned C = (unsigned)T.misc[1] * (unsigned)(NKT1 * 8);
     for (int g = 0; g < 2; ++g) {
     const int lo = fc1_lo(T, g, b), hi = fc1_lo(T, g, b + 1);
     for (int gk = lo; gk < hi;) {
         const int it = gk / NKT1, kt0 = gk % NKT1, kt1 = min(NKT1, hi - (it * NKT1));
         const Item I = item_of(T, it / ITEMS, it % ITEMS);
-        const bool rowx = !P.dense && I.n <= TP2_ROWX;   // x rows straight from xq by per-row TMA (no gather)
-        const int np = P.dense ? P.md : (rowx ? I.n : (I.n + 7) & ~7);
+        const int np = P.dense ? P.md : (I.n + 7) & ~7;
         const uint8_t* xsrc = P.xg + (size_t)T.prow[I.pid] * DIM;
-        if (rowx && !rows_ok) {   // fused quantization: x is written in this launch
-            if (P.xb) wait_tokens(P, 0, 1);
-            rows_ok = true;
-        }
-        if (!P.dense && !rowx && I.pid != ready_pid) {   // the CTAs that gather this panel's x rows are done
+        if (!P.dense && I.pid != ready_pid) {   // the CTAs that gather this panel's x rows are done
             const unsigned need = gather_contrib(I, C, (unsigned)G);
             while (ld_relaxed_gpu(P.xg_cnt + par * MAXP + I.pid) < need) {}
             (void)ld_acquire_gpu(P.xg_cnt + par * MAXP + I.pid);
             asm volatile("fence.proxy.async.global;" ::: "memory");
             ready_pid = I.pid;
         }
+#pragma unroll 1   // one TMA-issuing lane: an unrolled body only grows the code (left to itself the compiler unrolls this loop 4x: +0.6 us at M <= 8)
         for (int kt = kt0; kt < kt1; ++kt, ++n) {
             uint8_t* st = smem + s * STAGE;
-            uint64_t* fb = &full[s / KPS];
+            uint64_t* fb = &full[s];
             if (n >= nA) {   // pass B: full stage
                 TL1(n, 4);
-                if ((s & (KPS - 1)) == 0) {
-                    mbar_wait(&empty[s / KPS], ph ^ 1);
-                    TL1(n, 3);
-                    mbar_arrive_expect_tx(fb, (unsigned)(KPS * (STAGE_WS + np * 128)));
-                }
+                mbar_wait(&empty[s], ph ^ 1);
+                TL1(n, 3);
+                mbar_arrive_expect_tx(fb, (unsigned)(STAGE_WS + np * 128));
                 const int row = I.e * (NKT1 * 4) + kt * 4;
                 tma_load_5d(st, P.tmaps + 0, 0, 0, I.q, 0, row, fb);
                 tma_load_4d(st + STAGE_W, P.tmaps + 1, 0, I.q, 0, row, fb);
             }
             if (P.dense) { if (n >= nA) { TL1(n, 5); tma_load_2d(st + STAGE_WS, &P.xmap, kt * 128, 0, fb); } }
-            else if (rowx) { for (int r = 0; r < I.n; ++r) tma_load_2d_row(st + STAGE_WS + r * 128, &P.xrow, kt * 128, T.ent[I.ebase + r], fb); }
             else bulk_g2s(st + STAGE_WS, xsrc + (size_t)kt * np * 128, (unsigned)(np * 128), fb);
             if (++s == NST) { s = 0; ph ^= 1; }
         }
@@ -1221,28 +801,17 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
     unsigned* pready = reinterpret_cast<unsigned*>(T.qq);   // panel-ready bit set (smem, producer lane only)
     for (int i = 0; i < MAXP / 32; ++i) pready[i] = 0u;
     int vnext = (int)atomicAdd(P.fc2_next + par, 1u);
-    // the next unit's panel flag is loaded (acquire) right after this unit's loads are issued, so its round trip overlaps the
-    // producer's empty-slot waits instead of delaying the next unit's first TMA (most units are a new panel for this CTA)
-    unsigned hf_next = 0u;
-    auto flag_prefetch = [&]() {
-        hf_next = 0u;
-        if (!TP2_HF_PREFETCH || vnext >= V2) return;
-        int rt2, p2;
-        unit_of(T, vnext, rt2, p2);
-        if (!((pready[p2 >> 5] >> (p2 & 31)) & 1u)) hf_next = ld_acquire_gpu(P.h_flags + p2);
-    };
     for (int j = 0;; ++j) {
         int v = -1;
         if (vnext < V2) {
             v = vnext;
             vnext = (int)atomicAdd(P.fc2_next + par, 1u);   // the next unit's grab is in flight during this one
         }
-        const unsigned hf = hf_next;
         int2* su = reinterpret_cast<int2*>(s_unit) + (j & 7);
         if (v < 0) {   // sentinel: consumers read -1 at the next stage
-            mbar_wait(&empty[s / KPS], ph ^ 1);   // (s is stage-aligned: every piece / unit is)
+            mbar_wait(&empty[s], ph ^ 1);
             *reinterpret_cast<volatile int*>(&su->x) = -1;
-            mbar_arrive(&full[s / KPS]);
+            mbar_arrive(&full[s]);
             break;
         }
         int rtile, upid;
@@ -1252,7 +821,7 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
         // panel readiness is cached in a CTA-local bit set: only the first unit of a panel pays an acquire + proxy fence
         bool ready = (pready[I.pid >> 5] >> (I.pid & 31)) & 1u;
         if (j == 0 && ready) STAMPT(P, 43);
-        if (!ready && (hf == epoch || ld_acquire_gpu(P.h_flags + I.pid) == epoch)) {
+        if (!ready && ld_acquire_gpu(P.h_flags + I.pid) == epoch) {
             if (j == 0) STAMPT(P, 43);
             asm volatile("fence.proxy.async.global;" ::: "memory");   // hq (generic writes, other CTAs) -> async-proxy bulk reads
             pready[I.pid >> 5] |= 1u << (I.pid & 31);
@@ -1261,15 +830,13 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
         const uint8_t* hsrc = P.hq + (size_t)I.pid * NKT2 * NMAX * 128;
         if (ready) {   // one pass: weights + B operand per stage
             for (int kt = 0; kt < NKT2; ++kt) {
-                uint64_t* fb = &full[s / KPS];
-                if ((kt & (KPS - 1)) == 0) {
-                    mbar_wait(&empty[s / KPS], ph ^ 1);
-                    if (kt == 0) {
-                        *reinterpret_cast<volatile int*>(&su->y) = I.ebase;
-                        *reinterpret_cast<volatile int*>(&su->x) = rtile | (I.n << 4) | (I.e << 10) | (I.pid << 20);
-                    }
-                    mbar_arrive_expect_tx(fb, (unsigned)(KPS * (STAGE_WS + np * 128)));
+                uint64_t* fb = &full[s];
+                mbar_wait(&empty[s], ph ^ 1);
+                if (kt == 0) {
+                    *reinterpret_cast<volatile int*>(&su->y) = I.ebase;
+                    *reinterpret_cast<volatile int*>(&su->x) = rtile | (I.n << 4) | (I.e << 10) | (I.pid << 20);
                 }
+                mbar_arrive_expect_tx(fb, (unsigned)(STAGE_WS + np * 128));
                 uint8_t* st = smem + s * STAGE;
                 const int sl = I.e * (INTER / 32) + kt * 4;
                 tma_load_3d(st, P.tmaps + 2, 0, rtile * 4, sl, fb);
@@ -1277,20 +844,17 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
                 bulk_g2s(st + STAGE_WS, hsrc + (size_t)kt * NMAX * 128, (unsigned)(np * 128), fb);
                 if (++s == NST) { s = 0; ph ^= 1; }
             }
-            flag_prefetch();
             continue;
         }
         int s0 = s; unsigned ph0 = ph;
         for (int kt = 0; kt < NKT2; ++kt) {   // pass A: the unit's weights (h not published yet)
-            uint64_t* fb = &full[s / KPS];
-            if ((kt & (KPS - 1)) == 0) {
-                mbar_wait(&empty[s / KPS], ph ^ 1);
-                if (kt == 0) {
-                    *reinterpret_cast<volatile int*>(&su->y) = I.ebase;
-                    *reinterpret_cast<volatile int*>(&su->x) = rtile | (I.n << 4) | (I.e << 10) | (I.pid << 20);
-                }
-                mbar_arrive_expect_tx(fb, (unsigned)(KPS * (STAGE_WS + np * 128)));
+            uint64_t* fb = &full[s];
+            mbar_wait(&empty[s], ph ^ 1);
+            if (kt == 0) {
+                *reinterpret_cast<volatile int*>(&su->y) = I.ebase;
+                *reinterpret_cast<volatile int*>(&su->x) = rtile | (I.n << 4) | (I.e << 10) | (I.pid << 20);
             }
+            mbar_arrive_expect_tx(fb, (unsigned)(STAGE_WS + np * 128));
             uint8_t* st = smem + s * STAGE;
             const int sl = I.e * (INTER / 32) + kt * 4;
             tma_load_3d(st, P.tmaps + 2, 0, rtile * 4, sl, fb);
@@ -1303,10 +867,9 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
         asm volatile("fence.proxy.async.global;" ::: "memory");
         pready[I.pid >> 5] |= 1u << (I.pid & 31);
         for (int kt = 0; kt < NKT2; ++kt) {   // pass B: the unit's B operand
-            bulk_g2s(smem + s0 * STAGE + STAGE_WS, hsrc + (size_t)kt * NMAX * 128, (unsigned)(np * 128), &full[s0 / KPS]);
+            bulk_g2s(smem + s0 * STAGE + STAGE_WS, hsrc + (size_t)kt * NMAX * 128, (unsigned)(np * 128), &full[s0]);
             if (++s0 == NST) { s0 = 0; ph0 ^= 1; }
         }
-        flag_prefetch();
     }
 }
 
@@ -1328,16 +891,15 @@ __device__ __forceinline__ void release_helper(const Params& P, uint64_t* epi, c
                 unsigned old = 0;
                 // one acq_rel atomic: releases this item's act / amax (consumer stores ordered by the epi mbarrier), and the panel's
                 // 4th item acquires the other 3 (the __shfl_sync orders the other lanes' loads after lane 0's acquire)
-                if (lane == 0) { if (TP2_REL_FENCES) { fence_acq_rel_gpu(); old = atomicAdd(P.pan_cnt + par * MAXP + pid, 1u); } else old = atom_add_acq_rel_gpu(P.pan_cnt + par * MAXP + pid, 1u); STAMPT(P, 46); }
+                if (lane == 0) { old = atom_add_acq_rel_gpu(P.pan_cnt + par * MAXP + pid, 1u); STAMPT(P, 46); }
                 old = __shfl_sync(0xffffffffu, old, 0);
                 if (old == (unsigned)ITEMS - 1u) {
-                    if (TP2_REL_FENCES) fence_acq_rel_gpu();
                     if (lane == 0) STAMPT(P, 47);
                     quantize_panel(P, T, pid, lane, 32);
                     if (lane == 0) STAMPT(P, 44);
                     asm volatile("fence.proxy.async.global;" ::: "memory");   // hq is read by bulk copies (async proxy)
                     __syncwarp();
-                    if (lane == 0) { if (TP2_REL_FENCES) fence_acq_rel_gpu(); st_release_gpu(P.h_flags + pid, epoch); STAMPT(P, 41); }
+                    if (lane == 0) { st_release_gpu(P.h_flags + pid, epoch); STAMPT(P, 41); }
                 }
             }
             gk = (it + 1) * NKT1;
@@ -1352,7 +914,7 @@ __device__ __forceinline__ void store_helper(const Params& P, uint8_t* smem, con
     for (int j = 0;; ++j) {
         const int bo = j & 1;
         mbar_wait(&fullo[bo], (unsigned)(j >> 1) & 1u);
-        const volatile int* oi = reinterpret_cast<const volatile int*>(smem + OFF_TAB + TAB_UNIT + (16 + NRTP) * 4) + bo * 4;
+        const volatile int* oi = reinterpret_cast<const volatile int*>(smem + OFF_TAB + TAB_OUTI) + bo * 4;
         const int n = oi[2];
         if (n < 0) break;
         const int rtile = oi[0], ebase = oi[1];
@@ -1366,10 +928,8 @@ __device__ __forceinline__ void store_helper(const Params& P, uint8_t* smem, con
         }
         __syncwarp();
         if ((threadIdx.x & 31) == 0) mbar_arrive(&freeo[bo]);   // the tile's smem reads are done
-        if (TP2_STREAM_TAIL || TP2_T1_DYN) {   // both store warps' global stores of this unit done -> count it on its row tile
-            named_bar_sync(5, 64);
-            if (half == 0 && (threadIdx.x & 31) == 0) { fence_acq_rel_gpu(); atomicAdd(P.rt_cnt + par * NRT + rtile, 1u); }
-        }
+        named_bar_sync(5, 64);   // both store warps' global stores of this unit done -> count it on its row tile (the T1 queue waits per row tile)
+        if (half == 0 && (threadIdx.x & 31) == 0) { fence_acq_rel_gpu(); atomicAdd(P.rt_cnt + par * NRT + rtile, 1u); }
     }
     __syncwarp();
     if ((threadIdx.x & 31) == 0) mbar_arrive(sdone);
@@ -1396,7 +956,6 @@ __device__ __forceinline__ void fc1_piece(const Params& P, uint8_t* smem, uint64
     float C[R], D[R];
 #pragma unroll
     for (int i = 0; i < R; ++i) { C[i] = 0.f; D[i] = 0.f; }
-    uint32_t A0[4][4], A1[4][4];
     const uint64_t desc0 = make_desc_sw128(smem_u32(smem + STAGE_WS));
     // owner: the epilogue's per-column factor -- loads issued now, consumed (stored to smem) after the k-loop
     // (no T.am zeroing here: the previous owner epilogue's tid < n threads may still be reading T.am -- stage 2 writes every
@@ -1413,16 +972,16 @@ __device__ __forceinline__ void fc1_piece(const Params& P, uint8_t* smem, uint64
     }
     int sprev = 0, kt = kt0;
     TSTART(t_loop);
-    kstep<N, true>(smem, full, empty, s, ph, sprev, A0, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane, true);
+    kstep<N, true>(smem, full, empty, s, ph, sprev, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane);
 #ifdef TP2_STAMPS
     if (P.dbg && tid == 0 && dbg_smem()[37] == 0ull) dbg_smem()[37] = gtimer();   // first FC1 stage consumed (light-stamps safe)
 #endif
     ++kt;
     for (; kt + 1 < kt1; kt += 2) {
-        kstep<N, false>(smem, full, empty, s, ph, sprev, A1, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane, true);
-        kstep<N, false>(smem, full, empty, s, ph, sprev, A0, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane, true);
+        kstep<N, false>(smem, full, empty, s, ph, sprev, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane);
+        kstep<N, false>(smem, full, empty, s, ph, sprev, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane);
     }
-    if (kt < kt1) kstep<N, false>(smem, full, empty, s, ph, sprev, A1, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane, true);
+    if (kt < kt1) kstep<N, false>(smem, full, empty, s, ph, sprev, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane);
     kfinish<N>(empty, sprev, C, D, L.lane);
     if (fs_mine) {
         if (P.xb && P.dense && fs_t < P.M) {
@@ -1432,9 +991,6 @@ __device__ __forceinline__ void fc1_piece(const Params& P, uint8_t* smem, uint64
         T.fs[tid] = fs_x * (fs_s2 * 64.0f);   // published by the epilogue's first barrier
     }
     TACC(P, 8, t_loop);
-#if defined(TP2_STAMPS) && !defined(TP2_LIGHT_STAMPS)
-    if (P.dbg && tid == 0 && TP2_CLASS_STATS) { dbg_smem()[16 + (N / 8 - 1)] += (kt1 - kt0); dbg_smem()[20 + (N / 8 - 1)] += clock64() - t_loop; }
-#endif
     TSTART(t_part);
 
     if (kt0 != 0) {   // not the owner: publish the fp32 partial (thread-private slots) for the CTA that owns k-tile 0
@@ -1449,11 +1005,10 @@ __device__ __forceinline__ void fc1_piece(const Params& P, uint8_t* smem, uint64
         const int iend = (it + 1) * NKT1;
         int nsrc = 0;
         while (b + 1 + nsrc < G && fc1_lo(T, grp, b + 1 + nsrc) < iend) ++nsrc;
-        if (tid < nsrc && (KPS == 1 || fc1_lo(T, grp, b + 1 + tid) < fc1_lo(T, grp, b + 2 + tid))) wait_eq(P.part_flags + grp * G + b + 1 + tid, epoch);   // all sources polled in parallel
+        if (tid < nsrc) wait_eq(P.part_flags + grp * G + b + 1 + tid, epoch);   // all sources polled in parallel
         named_bar_sync(1, NCONS);
 #pragma unroll 2
         for (int k = 0; k < nsrc; ++k) {   // added in CTA order
-            if (KPS > 1 && fc1_lo(T, grp, b + 1 + k) == fc1_lo(T, grp, b + 2 + k)) continue;   // (empty range: no partial)
             float4 v[R / 4];
 #pragma unroll
             for (int i = 0; i < R / 4; ++i) v[i] = __ldcg(part_f4(P, grp * G + b + 1 + k, i, tid));
@@ -1559,34 +1114,9 @@ __device__ __forceinline__ void quantize_panel(const Params& P, const Tabs& T, i
     }
 }
 
-// FC2 epilogue deferred past the next unit's first k-step (TP2_FC2_DEFER): the unit's BF16 outputs wait in registers, packed (row g,
-// row g + 8) per token slot, so the out-tile stores + store-warp handoff overlap the next unit's first MMA
-struct Fc2Defer { uint32_t pk[8]; int nh, j, rtile, ebase, n; bool pend; };
-__device__ __forceinline__ void fc2_flush(uint8_t* smem, const Lane& L, Fc2Defer& d, uint64_t* fullo, uint64_t* freeo) {
-    if (!d.pend) return;
-    const int bo = d.j & 1;
-    if (d.j >= 2) mbar_wait(&freeo[bo], (unsigned)((d.j >> 1) - 1) & 1u);   // tile drained (unit j - 2)
-    __nv_bfloat16* out_t = reinterpret_cast<__nv_bfloat16*>(smem + OFF_STG + bo * OUT_TILE);
-#pragma unroll
-    for (int j2 = 0; j2 < 8; ++j2) {
-        if (j2 >= d.nh) continue;
-        const int tk = 8 * (j2 >> 1) + 2 * L.tig + (j2 & 1);
-        uint16_t* o = reinterpret_cast<uint16_t*>(out_t + tk * OUT_PITCH + L.w * 64 + L.Lb);
-        o[0] = (uint16_t)(d.pk[j2] & 0xFFFFu);
-        o[8] = (uint16_t)(d.pk[j2] >> 16);
-    }
-    if (L.tid == 0) {
-        volatile int* oi = reinterpret_cast<volatile int*>(smem + OFF_TAB + TAB_UNIT + (16 + NRTP) * 4) + bo * 4;
-        oi[0] = d.rtile; oi[1] = d.ebase; oi[2] = d.n;
-    }
-    __syncwarp();
-    if (L.lane == 0) mbar_arrive(&fullo[bo]);
-    d.pend = false;
-}
-
 template <int N>
 __device__ __forceinline__ void fc2_unit(const Params& P, uint8_t* smem, uint64_t* full, uint64_t* empty, const Tabs& T, const Lane& L,
-                                         int& s, unsigned& ph, const Item& I, int rtile, int j, uint64_t* fullo, uint64_t* freeo, Fc2Defer& df) {
+                                         int& s, unsigned& ph, const Item& I, int rtile, int j, uint64_t* fullo, uint64_t* freeo) {
     constexpr int R = N / 2;
     TSTART(t_k2);
 #ifdef TP2_STAMPS
@@ -1594,24 +1124,18 @@ __device__ __forceinline__ void fc2_unit(const Params& P, uint8_t* smem, uint64_
 #endif
     TL(P, jj, 3);
     FC2A(P, 10);   // decode + unit setup
-    const float f2r = TP2_PIN_LOADS ? ldv_nc_f32(P.fc2_s2 + I.e) : __ldg(P.fc2_s2 + I.e);
+    const float f2r = ldv_nc_f32(P.fc2_s2 + I.e);   // (pinned: issued here, consumed after the k-loop)
     float C[R], D[R];
 #pragma unroll
     for (int i = 0; i < R; ++i) { C[i] = 0.f; D[i] = 0.f; }
-    uint32_t A0[4][4], A1[4][4];
     const uint64_t desc0 = make_desc_sw128(smem_u32(smem + STAGE_WS));
     int sprev = 0;
-    kstep<N, true>(smem, full, empty, s, ph, sprev, A0, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane, true);
-    float hsr[R / 2];   // the stage landed => the gather lanes saw the panel's h flag: its scales are readable
+    kstep<N, true>(smem, full, empty, s, ph, sprev, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane);
+    float hsr[R / 2];   // the stage landed => the gather lanes saw the panel's h flag: its scales are readable (pinned loads)
 #pragma unroll
-    for (int j = 0; j < R / 2; ++j) hsr[j] = TP2_PIN_LOADS ? ldv_cg_f32(P.hs + I.pid * NMAX + 8 * (j >> 1) + 2 * L.tig + (j & 1))
-                                                             : __ldcg(P.hs + I.pid * NMAX + 8 * (j >> 1) + 2 * L.tig + (j & 1));
-    if (TP2_FC2_DEFER) fc2_flush(smem, L, df, fullo, freeo);   // the previous unit's epilogue, under this unit's first MMA
+    for (int j = 0; j < R / 2; ++j) hsr[j] = ldv_cg_f32(P.hs + I.pid * NMAX + 8 * (j >> 1) + 2 * L.tig + (j & 1));
 #pragma unroll
-    for (int kt = 1; kt < NKT2; ++kt) {
-        if (kt & 1) kstep<N, false>(smem, full, empty, s, ph, sprev, A1, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane, true);
-        else kstep<N, false>(smem, full, empty, s, ph, sprev, A0, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane, true);
-    }
+    for (int kt = 1; kt < NKT2; ++kt) kstep<N, false>(smem, full, empty, s, ph, sprev, C, D, desc0 + (uint64_t)(s * (STAGE >> 4)), L.frag_off, L.scl_off, L.lane);
     kfinish<N>(empty, sprev, C, D, L.lane);
     {
         const float f2 = f2r * 64.0f;
@@ -1623,17 +1147,6 @@ __device__ __forceinline__ void fc2_unit(const Params& P, uint8_t* smem, uint64_
     TACC(P, 13, t_k2);
     TSTART(t_e2);
     // ---- epilogue: BF16(D * hs * s2 * 64) -> out tile (j & 1); the store warps write it to every (token, slot) of this expert
-    if (TP2_FC2_DEFER) {
-#pragma unroll
-        for (int j2 = 0; j2 < R / 2; ++j2) {
-            const int i0 = ((j2 >> 1) << 2) | (j2 & 1);
-            df.pk[j2] = (uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(D[i0] * hsr[j2])) |
-                        ((uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(D[i0 + 2] * hsr[j2])) << 16);
-        }
-        df.nh = R / 2; df.j = j; df.rtile = rtile; df.ebase = I.ebase; df.n = I.n; df.pend = true;
-        FC2A(P, 12);
-        return;
-    }
     const int bo = j & 1;
     if (j >= 2) mbar_wait(&freeo[bo], (unsigned)((j >> 1) - 1) & 1u);   // tile drained (unit j - 2)
     __nv_bfloat16* out_t = reinterpret_cast<__nv_bfloat16*>(smem + OFF_STG + bo * OUT_TILE);   // [NMAX][OUT_PITCH]
@@ -1646,7 +1159,7 @@ __device__ __forceinline__ void fc2_unit(const Params& P, uint8_t* smem, uint64_
         o[8] = __float2bfloat16_rn(D[i0 + 2] * hsr[j2]);
     }
     if (L.tid == 0) {
-        volatile int* oi = reinterpret_cast<volatile int*>(smem + OFF_TAB + TAB_UNIT + (16 + NRTP) * 4) + bo * 4;
+        volatile int* oi = reinterpret_cast<volatile int*>(smem + OFF_TAB + TAB_OUTI) + bo * 4;
         oi[0] = rtile; oi[1] = I.ebase; oi[2] = I.n;
     }
     __syncwarp();
@@ -1724,36 +1237,20 @@ __device__ __forceinline__ void t1_msg(const Params& P, const Tabs& T, int rtile
     t1_finish(P, rtile, t, m, epoch, L1);
 }
 
-// warp 18 during FC2: this CTA's T1 pairs in row-tile order (pairs j = b + pi G: row tile j / M is non-decreasing), each as soon as
-// its row tile's FC2 units are all stored (rt_cnt, published per unit by the store warps); lane 0 polls, the warp shares it
-__device__ __forceinline__ void t1_stream(const Params& P, const Tabs& T, unsigned epoch, unsigned par) {
-    const int G = gridDim.x, b = blockIdx.x, M = P.M, lane = threadIdx.x & 31;
-    const unsigned need = (unsigned)T.misc[2];
-    const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
-    int ready = -1;
-    for (int pi = 0; pi < mine; ++pi) {
-        const int j = b + pi * G, rtile = j / M, t = j - rtile * M;
-        if (rtile > ready) {
-            if (lane == 0) wait_ge(P.rt_cnt + par * NRT + rtile, need);
-            __syncwarp();
-            ready = rtile;
-        }
-        for (int m = lane; m < NMSG; m += 32) t1_msg(P, T, rtile, t, m, epoch);
-    }
-}
-
 __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, unsigned epoch, unsigned par) {
-    const int G = gridDim.x, b = blockIdx.x, M = P.M, topk = P.topk;
+    const int G = gridDim.x, b = blockIdx.x, M = P.M;
     const unsigned need = (unsigned)T.misc[2];
-    // T1 (TP2_STREAM_TAIL: done by warp 18 during FC2, row tile by row tile -- see t1_stream)
-    if (TP2_T1_DYN && !TP2_STREAM_TAIL) {
+    // T1: items (row tile, 8 tokens) from a queue in row-tile order (rt_cnt counted per unit by the store warps): the CTAs leaving
+    // FC2 first reduce the row tiles already complete instead of all waiting for the last one
+    {
         constexpr int TCH = 8;   // tokens per item
         const int ntc = (M + TCH - 1) / TCH, nitem = NRT * ntc;
         volatile int* s_item = reinterpret_cast<volatile int*>(const_cast<int*>(T.misc) + 16);
         unsigned done_rt = 0u;   // row tiles known complete (thread 0)
         // nitem <= G (M <= 8: 14 items): every CTA grabs exactly once -- the first nitem arrivals take one item each, the rest leave --
-        // so no second grab's round trip sits between the last item's messages and the exit
-        const bool one_grab = TP2_T1_ONE_GRAB && nitem <= G;
+        // so no second grab's round trip sits between the last item's messages and the exit.  (Grabbing the next item ahead of the
+        // current one was measured worse: the first CTAs take two items each and serialize them.)
+        const bool one_grab = nitem <= G;
         for (;;) {
             if (tid == 0) {
                 const int it = (int)atomicAdd(P.fc2_next + 2 + par, 1u);
@@ -1785,27 +1282,9 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
 #endif
             if (one_grab) break;
         }
-    } else if (!TP2_STREAM_TAIL) {
-        const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
-        // one poller per row tile this CTA's pairs need (thousands of threads spinning on the NRT counters slowed both the polls
-        // and the counters' own atomic updates), then the consumers' barrier releases everyone
-        if (tid < NRT) {
-            bool needed = false;
-            for (int pi = 0; pi < mine && !needed; ++pi) needed = (b + pi * G) / M == tid;
-            if (needed) wait_ge(P.rt_cnt + par * NRT + tid, need);
-        }
-        named_bar_sync(1, NCONS);
-#if defined(TP2_STAMPS)
-        if (tid == 0 && P.dbg) dbg_smem()[30] = gtimer();   // row-tile waits done (T1)
-#endif
-        for (int x = tid; x < mine * NMSG; x += NCONS) {   // (two messages per thread per round measured no better)
-            const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
-            t1_msg(P, T, rtile, t, m, epoch);
-        }
     }
     if (P.ndev == 1) return;
     STAMP(P, 4);
-    (void)need;
     {   // every (row tile, token) of this CTA: the NDEV ranks' messages, summed in rank order (fp32), one BF16 RN
         const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
         const uint4* rs_me = P.rs[P.my_rank] + par * RS_PAR;
@@ -1847,7 +1326,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     uint64_t* sdone = freeo + 2;
     uint64_t* xsb = sdone + 1;
     int* s_unit = reinterpret_cast<int*>(smem + OFF_TAB + TAB_UNIT);
-    int* s_rtc = s_unit + 16;   // after the int2 [8] unit ring
     const int tid = threadIdx.x, warp = tid >> 5;
 #ifdef TP2_STAMPS
     if (tid == 0) { g_dbg_smem = reinterpret_cast<unsigned long long*>(smem + OFF_TAB + TAB_DBG); for (int i = 0; i < 48; ++i) g_dbg_smem[i] = 0ull; g_dbg_smem[26] = clock64(); }
@@ -1856,26 +1334,26 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     if (tid == 0) { g_tl_ptr = P.tl; g_tl_j = 0; g_tl_fc1 = 1; }
 #endif
     STAMP(P, 0);
-    if (TP2_EARLY_MAP_PF && tid == PROD_WARP * 32) {   // the weight tensor maps (host-written before this launch) into the descriptor cache during the
-#pragma unroll                                           // prologue: the producer's first TMA no longer waits for the 128-B descriptor fetch
+    if (tid == PROD_WARP * 32) {   // the weight tensor maps (written by a host copy before this launch: no tensormap-proxy acquire fence needed)
+#pragma unroll                     // into the descriptor cache during the prologue: the producer's first TMA no longer waits for the 128-B descriptor fetch
         for (int i = 0; i < 4; ++i) asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(P.tmaps + i)) : "memory");
     }
-    const bool small_tab = P.M * P.topk <= 128 && P.M <= NMAX && TP2_SMALL_TABLES;
-    const bool bw_tab = small_tab && TP2_SMALL_TABLES_BW;   // block-wide small tables (warps 0..7, build_tables_small3)
+    const bool small_tab = P.M * P.topk <= 128 && P.M <= NMAX;   // block-wide small tables (warps 0..7, build_tables_small3)
     // fused quantization threads (small tables: warps 8..15; block-wide tables: the producer warpgroup).  x is complete before the
-    // routing kernels (they read it) and the previous launch (same workspace) completed before them: with a PDL launch the
-    // quantization starts before griddepcontrol.wait, overlapping the routing kernel's tail; every other thread waits first
-    const bool qthr = P.xb && (tid < NCONS ? (small_tab && tid >= 256) : !small_tab);
-    const bool qpre = TP2_QUANT_PRE && P.pdl_early && qthr;
-    const bool early_xs = TP2_EARLY_XS && P.dense && P.xb && small_tab;   // (the producer warpgroup is idle)
-    const bool early_xq = TP2_EARLY_XQ && P.xb && !P.dense && P.M <= TP2_EARLY_XQ_MAXM;
-    if (!qpre && (!P.pdl_early || P.xb)) griddep_wait();   // (no-op when not PDL-launched; fused quantization: the routing is the previous kernel)
+    // routing kernels (they read it) and the previous launch (same workspace) completed before them; every thread waits first
+    // (running the quantization before griddepcontrol.wait under a PDL launch measured neutral)
+    const bool early_xs = P.dense && P.xb && small_tab;   // dense + fused quantization: warp 19 acquires the token flags (+ stages the owners'
+                                                          // scales) during the prologue (the producer warpgroup is idle), so the producer
+                                                          // issues stage 0's x right behind its weights (no flag round trip after the tables)
+    const bool early_xq = P.xb && !P.dense && P.M <= TP2_EARLY_XQ_MAXM;   // compact panels + fused quantization: the producer warpgroup acquires
+                                                          // every token flag during the prologue (after its own quantization), so the consumers
+                                                          // start the x gather right after the __syncthreads (no flag round trip)
+    if (!P.pdl_early || P.xb) griddep_wait();   // (no-op when not PDL-launched; fused quantization: the routing is the previous kernel)
     STAMP(P, 35);   // (stamps) past the PDL wait: > start when launched before the previous kernel completed
     unsigned ep_early = 0u;   // epoch counter (final: the previous launch completed): one pinned load now, stored to smem before the sync
-    if (TP2_EARLY_EPOCH && tid == 0) asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(ep_early) : "l"(P.work));
-    if (tid < NST / KPS) mbar_init(&full[tid], 1u);   // the producer lane's expect_tx arrive (+ tx bytes)
-    else if (tid >= 96 && tid < 96 + NRT) s_rtc[tid - 96] = 0;
-    else if (tid >= 32 && tid < 32 + NST / KPS) mbar_init(&empty[tid - 32], (unsigned)(NCONS / 32));
+    if (tid == 0) asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(ep_early) : "l"(P.work));   // (latency under the table build)
+    if (tid < NST) mbar_init(&full[tid], 1u);   // the producer lane's expect_tx arrive (+ tx bytes)
+    else if (tid >= 32 && tid < 32 + NST) mbar_init(&empty[tid - 32], (unsigned)(NCONS / 32));
     else if (tid >= 64 && tid < 68) mbar_init(&epi[tid - 64], (unsigned)(NCONS / 32));
     else if (tid == 70 || tid == 71) mbar_init(&fullo[tid - 70], (unsigned)(NCONS / 32));
     else if (tid == 72 || tid == 73) mbar_init(&freeo[tid - 72], 2u);
@@ -1886,7 +1364,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
         if (P.xb && small_tab && tid >= 256) {   // fused input quantization of tokens t = b, b + G, .. (small: warps 8..15)
             float* red = reinterpret_cast<float*>(smem + PRO_WS) + 32;
             for (int t = blockIdx.x; t < P.M; t += gridDim.x) quant_token<256>(P, t, tid - 256, red);
-            if (qpre) griddep_wait();
         }
     } else if (early_xs && warp == GATHER_WARP + 2) {   // dense: token flags acquired + owners' scales staged
         const int l = tid & 31;                                                                   // while the tables are built (xsb arrive after the sync)
@@ -1896,32 +1373,15 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     } else if (P.xb && !small_tab) {   // block-wide tables: the producer warpgroup quantizes
         float* red = reinterpret_cast<float*>(smem + OFF_TAB + TAB_QQ);   // (scratch, 64 words)
         for (int t = blockIdx.x; t < P.M; t += gridDim.x) quant_token<NTHREADS - NCONS>(P, t, tid - NCONS, red);
-        if (qpre) griddep_wait();
         if (tid == NCONS) STAMPT(P, 40);
     }
     if (small_tab) {
-        if (TP2_TABLES_CHECK && bw_tab && tid < 256) {   // diagnostic: one-warp tables first, copied to the staging area, compared after the block-wide build
-            if (warp == 0) {
-                build_tables_small2(P, smem, T);
-                __syncwarp();
-                for (int i = tid; i < TAB_QQ / 4; i += 32) reinterpret_cast<uint32_t*>(smem + OFF_STG)[i] = reinterpret_cast<const uint32_t*>(smem + OFF_TAB)[i];
-            }
-            named_bar_sync(2, 256);
-        }
-        if (bw_tab) { if (tid < 256) build_tables_small3(P, smem, T); }
-        else if (warp == 0) { if (TP2_SMALL_TABLES == 2) build_tables_small2(P, smem, T); else build_tables_small(P, smem, T); }
-        if (TP2_TABLES_CHECK && bw_tab && tid < 256) {
-            named_bar_sync(2, 256);
-            int bad = 0;
-            for (int i = tid; i < TAB_QQ / 4; i += 256)
-                if (reinterpret_cast<uint32_t*>(smem + OFF_STG)[i] != reinterpret_cast<const uint32_t*>(smem + OFF_TAB)[i] && !(i >= TAB_FS / 4 && i < TAB_MISC / 4)) ++bad;   // (fs / am: not tables)
-            if (bad) atomicAdd(P.work + 3, (unsigned)bad);
-        }
+        if (tid < 256) build_tables_small3(P, smem, T);   // warps 0..7 (named barrier 2); warps 8..15 quantize meanwhile
     } else if (tid < NCONS) {   // consumer warps (named barrier 1); the producer warpgroup quantizes meanwhile
         build_tables(P, smem, T);
     }
     if (early_xq && tid >= NCONS) wait_tokens(P, tid - NCONS, NTHREADS - NCONS);   // every token's flag: the consumers' gather follows the sync
-    if (TP2_EARLY_EPOCH && tid == 0) T.misc[6] = (int)ep_early;
+    if (tid == 0) T.misc[6] = (int)ep_early;
     fence_proxy_async_smem();       // prologue scratch (generic writes) precedes the ring's async-proxy writes
     __syncthreads();
     STAMP(P, 1);
@@ -1929,7 +1389,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
         setmaxnreg_dec<TP2_PROD_REGS>();
         if (warp == PROD_WARP) { if ((tid & 31) == 0) producer(P, smem, full, empty, T, s_unit, early_xs); return; }   // waits after pass A
         griddep_wait();
-        const unsigned epoch = (TP2_EARLY_EPOCH ? (unsigned)T.misc[6] : __ldcg(P.work)) + 1u, par = epoch & 1u;
+        const unsigned epoch = (unsigned)T.misc[6] + 1u, par = epoch & 1u;
         if (blockIdx.x == 0) {   // next launch's parity set (unused by this launch; the previous launch has completed): warps 17..19
             const int t2 = tid - NCONS - 32;
             if (t2 < NRT) P.rt_cnt[(par ^ 1u) * NRT + t2] = 0u;
@@ -1948,15 +1408,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
             if (l == 0) mbar_arrive(xsb);
         }
         if (warp == GATHER_WARP || warp == GATHER_WARP + 2) store_helper(P, smem, T, fullo, freeo, sdone, warp == GATHER_WARP ? 0 : 1, par);
-        else if (warp == GATHER_WARP + 1) {
-            release_helper(P, epi, T, epoch, par);
-            if (TP2_STREAM_TAIL) { t1_stream(P, T, epoch, par); __syncwarp(); named_bar_arrive(6, NCONS + 32); }
-        }
+        else if (warp == GATHER_WARP + 1) release_helper(P, epi, T, epoch, par);
         return;
     }
     setmaxnreg_inc<TP2_CONS_REGS>();
     griddep_wait();
-    const unsigned epoch = (TP2_EARLY_EPOCH ? (unsigned)T.misc[6] : __ldcg(P.work)) + 1u, par = epoch & 1u;
+    const unsigned epoch = (unsigned)T.misc[6] + 1u, par = epoch & 1u;
     const Lane L = lane_of();
     const int G = gridDim.x, b = blockIdx.x;
     const int P_tot = T.misc[2];
@@ -1977,7 +1434,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
                     const int e = (int)(j / (unsigned)(NKT1 * 8)), kt = (int)((j >> 3) % (unsigned)NKT1), c = (int)(j & 7);
                     const int pid = T.e2p[e];
                     const uint32_t pv = T.pinf[pid];
-                    if ((int)((pv >> 10) & 63u) <= TP2_ROWX) continue;   // row-mode panel: loaded by per-row TMA, not gathered
                     const int r = e - (int)(pv >> 16), np = ((int)((pv >> 10) & 63u) + 7) & ~7;
                     const uint4* xp = reinterpret_cast<const uint4*>(P.xq + (size_t)T.ent[e] * DIM + kt * 128 + c * 16);
                     v[u] = P.xb ? __ldcg(xp) : __ldg(xp);
@@ -2025,66 +1481,51 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     {
         TSTART(t_fc2all);
         int j = 0;
-        Fc2Defer df;
-        df.pend = false;
         for (;; ++j) {   // units from the producer's queue grabs
             TSTART(t_w);
             TL(P, j, 0);
             if (j == 0) FC2A_SET(P); else FC2A(P, 13);   // iteration tail
-            mbar_wait(&full[s / KPS], ph);
-            if (TP2_FC2_STAGGER && j == 0 && (tid >> 7) >= 2 && P.M >= TP2_FC2_STAGGER_MINM) {
-                const long long t0 = clock64();
-                while (clock64() - t0 < TP2_FC2_STAGGER) {}
-            }
+            mbar_wait(&full[s], ph);
             TL(P, j, 1);
             FC2A(P, 9);   // first-stage wait
             TACC(P, 28, t_w);
             if (j == 0) STAMP(P, 27);
             TSTART(t_sw);
             const int2 uv = make_int2(reinterpret_cast<volatile int*>(s_unit)[2 * (j & 7)], reinterpret_cast<volatile int*>(s_unit)[2 * (j & 7) + 1]);
-            if (uv.x < 0) { fc2_flush(smem, L, df, fullo, freeo); break; }
+            if (uv.x < 0) break;
             const int rtile = uv.x & 15;
             Item I;
             I.n = (uv.x >> 4) & 63; I.e = (uv.x >> 10) & 1023; I.pid = (uv.x >> 20) & 1023; I.ebase = uv.y; I.q = 0; I.u = 0;
             TACC(P, 11, t_sw);
             TL(P, j, 2);
             switch ((I.n + 7) >> 3) {
-                case 1: fc2_unit<8>(P, smem, full, empty, T, L, s, ph, I, rtile, j, fullo, freeo, df); break;
-                case 2: fc2_unit<16>(P, smem, full, empty, T, L, s, ph, I, rtile, j, fullo, freeo, df); break;
-                case 3: fc2_unit<24>(P, smem, full, empty, T, L, s, ph, I, rtile, j, fullo, freeo, df); break;
-                default: fc2_unit<32>(P, smem, full, empty, T, L, s, ph, I, rtile, j, fullo, freeo, df); break;
+                case 1: fc2_unit<8>(P, smem, full, empty, T, L, s, ph, I, rtile, j, fullo, freeo); break;
+                case 2: fc2_unit<16>(P, smem, full, empty, T, L, s, ph, I, rtile, j, fullo, freeo); break;
+                case 3: fc2_unit<24>(P, smem, full, empty, T, L, s, ph, I, rtile, j, fullo, freeo); break;
+                default: fc2_unit<32>(P, smem, full, empty, T, L, s, ph, I, rtile, j, fullo, freeo); break;
             }
-            if (tid == 0) ++s_rtc[rtile];
             TL(P, j, 6);
             TACC(P, 12, t_w);
         }
         {   // end marker for the store warps (in the next out tile), then wait until they drained everything
             const int bo = j & 1;
             if (j >= 2) mbar_wait(&freeo[bo], (unsigned)((j >> 1) - 1) & 1u);
-            if (tid == 0) reinterpret_cast<volatile int*>(smem + OFF_TAB + TAB_UNIT + (16 + NRTP) * 4)[bo * 4 + 2] = -1;
+            if (tid == 0) reinterpret_cast<volatile int*>(smem + OFF_TAB + TAB_OUTI)[bo * 4 + 2] = -1;
             __syncwarp();
             if (L.lane == 0) mbar_arrive(&fullo[bo]);
             mbar_wait(sdone, 0u);
         }
         TACC(P, 30, t_fc2all);
-        TSTART(t_rel);
-        if (tid == 0 && !TP2_STREAM_TAIL && !TP2_T1_DYN) {
-            fence_acq_rel_gpu();
-            for (int r = 0; r < NRT; ++r) if (s_rtc[r]) atomicAdd(P.rt_cnt + par * NRT + r, (unsigned)s_rtc[r]);   // ordered by the one fence above
-        }
-        TACC(P, 31, t_rel);
     }
     STAMP(P, 3);
     // CTA-done count (the last CTA advances the epoch for the next launch): issued before the tail so its round trip hides under T1 -- the
     // next launch cannot start before this grid has ended, and every CTA read the epoch at its start, so the early bump is harmless
     unsigned done_cnt = 0u;
-    if (TP2_EARLY_DONE && tid == 0) { fence_acq_rel_gpu(); done_cnt = atomicAdd(P.work + 1 + par, 1u); }
+    if (tid == 0) { fence_acq_rel_gpu(); done_cnt = atomicAdd(P.work + 1 + par, 1u); }
     tail(P, T, tid, epoch, par);
     STAMP(P, 6);
-    if (TP2_STREAM_TAIL) named_bar_sync(6, NCONS + 32);   // + warp 18 (its streamed T1 is done)
-    else named_bar_sync(1, NCONS);
+    named_bar_sync(1, NCONS);
     if (tid == 0) {
-        if (!TP2_EARLY_DONE) { fence_acq_rel_gpu(); done_cnt = atomicAdd(P.work + 1 + par, 1u); }
         if (done_cnt == (unsigned)G - 1u) atomicAdd(P.work, 1u);   // last CTA out: next epoch
 #ifdef TP2_STAMPS
         if (P.dbg) { dbg_smem()[7] = gtimer(); dbg_smem()[26] = clock64() - dbg_smem()[26]; for (int i = 0; i < 48; ++i) P.dbg[blockIdx.x * NSTAMP + i] = dbg_smem()[i]; }
@@ -2211,16 +1652,8 @@ void run(torch::Tensor xq, torch::Tensor xs, torch::Tensor w1, torch::Tensor s1,
         P.dense = M <= dense_maxm ? 1 : 0;
         TORCH_CHECK(M <= OS_MAXM, "one-shot all-reduce only: M <= OS_MAXM");
         static const int groups_minm = getenv("TP2_GROUPS_MINM") ? atoi(getenv("TP2_GROUPS_MINM")) : 16;
-        P.groups = (TP2_GROUPS == 2 || M >= groups_minm) ? 2 : 1;   // 2 groups: group 0's FC1 -> FC2 handoff hides under group 1's FC1
+        P.groups = M >= groups_minm ? 2 : 1;   // 2 groups: group 0's FC1 -> FC2 handoff hides under group 1's FC1 (+2 partial exchanges per CTA)
         P.md = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : 32));
-        if (!P.dense) {   // per-row x map for the compact panels of <= TP2_ROWX rows
-            const cuuint64_t dims[2] = {DIM, (cuuint64_t)M}, strides[1] = {DIM};
-            const cuuint32_t box[2] = {128, 1}, estr[2] = {1, 1};
-            const CUresult r = encode_fn()(&P.xrow, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(P.xq), dims, strides, box, estr,
-                                           CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-                                           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-            TORCH_CHECK(r == CUDA_SUCCESS, "x row tensor map: ", (int)r);
-        }
         if (P.dense) {
             TORCH_CHECK(M <= NMAX, "dense mode needs M <= 32");
             const cuuint64_t dims[2] = {DIM, (cuuint64_t)M}, strides[1] = {DIM};
