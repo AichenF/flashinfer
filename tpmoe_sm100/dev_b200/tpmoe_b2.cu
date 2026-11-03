@@ -188,6 +188,12 @@
 #define TPB2_TRACE 0   // Xtrace-style phase trace (xtrace.cuh / xtrace.py; b2_layer_ab --trace): dbg_ = the xtrace buffer (TPB2_DBG must be 0)
 #endif
 #define XT_ON TPB2_TRACE
+#ifndef XT_FMT
+#define XT_FMT TPB2_TRACE   // (TPB2_TRACE=2: the XTrace 8-B bounded layout; TPB2_XT_MASK = XT_MASK site groups)
+#endif
+#if defined(TPB2_XT_MASK) && !defined(XT_MASK)
+#define XT_MASK TPB2_XT_MASK
+#endif
 #include "xtrace.cuh"
 #ifndef TPB2_PF1
 #define TPB2_PF1 0   // small fused gate: warp 7 derives this CTA's first FC1 work from the gate ids (no tables) and L2-prefetches its first two
@@ -199,6 +205,8 @@
 #ifndef TPB2_PROBE
 #define TPB2_PROBE 0   // timing probes (WRONG results): 1 = no SF copies (tcgen05.cp), 2 = no MMAs, 4 = no B operand copies, 8 = no routed SFA bulk copies,
                        // 16 = SF copies only for the first 6 NS (stale finite scales later: no NaN slow paths)
+                       // 128 = no FC1 SFB store + proxy fence, 256 = relaxed h-publish counters, 512 = no rt-publish fence, 1024 = no FC2 outp stores,
+                       // 2048 = no T1 outp / shout loads
 #endif
 #ifndef TPB2_PGATE
 #define TPB2_PGATE 1   // fused gate, M > SMALLM: a token gated by 8 warps together (per-warp top-6 + merge; bitwise == gate_token)
@@ -243,6 +251,24 @@ __device__ __forceinline__ void dly_spin(unsigned ns) {
 #ifndef TPB2_PFF
 #define TPB2_PFF 0   // > 0: L2-prefetch this many first stages of the CTA's first routed FC1 piece once the panels are known (mid-tables)
 #endif
+#ifndef TPB2_RPRE
+#define TPB2_RPRE 0   // > 0 (small fused gate): warp 7 derives this CTA's first routed FC1 piece from the gate ids (the tables' panel order:
+                      // experts ascending) and issues its first TPB2_RPRE stages (weights + SFA) into ring stages 0.. before the tables;
+                      // the producer skips them (first-stage DRAM latency off the FC1 start, ~0.8 us at M1-8)
+#endif
+#ifndef TPB2_PUBRED
+#define TPB2_PUBRED 0   // static FC2 order (the B warp polls pan_cnt, the ready list is unused): the h publish is a red.release (no atomic
+                        // round trip on the epilogue's publishing lane) instead of atom.acq_rel + ready-list append
+#endif
+#ifndef TPB2_RTMAJ
+#define TPB2_RTMAJ 0   // > 0 (FC2VAR): the FC2 row tiles of the last TPB2_RTMAJ slots (>= 1000: the slots from the pairs region on) go in
+                       // 256-row-tile-major order (row pairs of every late slot, then the next 256 rows): T1 tiles complete one by one at the
+                       // end of FC2, so CTAs out of FC2 tickets T1 + all-reduce the finished tiles while the rest of FC2 runs
+#endif
+#ifndef TPB2_FC2CAP
+#define TPB2_FC2CAP 0   // >0: a unit claims at most ceil(FC2 units / PG) + FC2CAP - 1 FC2 tickets (idle units no longer take every ticket while the
+                        // FC1 units stream: at M1 92 idle CTAs took all 224 tiles, up to 4 each, the 56 FC1 CTAs none)
+#endif
 #ifndef TPB2_FC2RLX
 #define TPB2_FC2RLX 0   // FC2 tickets claimed two ahead and the ready-list slots read relaxed (no acquire stall in the producer's issue path);
                         // the B warp acquires the panel's FC1 count itself before its h copies
@@ -285,6 +311,22 @@ __device__ __forceinline__ void dly_spin(unsigned ns) {
 #endif
 #ifndef TPB2_PROBE_T1LOCAL
 #define TPB2_PROBE_T1LOCAL 0   // PROBE (wrong output): the T1's reduce-scatter sends go to this rank's own buffer, no all-reduce (NVLink cost of T1)
+#endif
+#ifndef TPB2_MC
+#define TPB2_MC 0   // NVLS multicast pushes (multimem.st, one store reaches the 4 ranks; receivers still sum in rank order): 1 the one-shot
+                    // T1 sends, 2 the all-gather pushes, 4 the one-shot T1 sends + a local store of the own copy (host: rs / ag pointer lists
+                    // carry the multicast address as entry NDEV; b2_layer_ab --mcbuf).  Bitwise but no gain (v77 runs, node -261): MC 1 M1
+                    // +1.0 us (the slowest rank's own copy now waits for the switch), MC 4 M8 -0.1 / M16 0; b2_ar_bench: AG multicast slower at
+                    // M64+ (the switch's own copy costs ingress, and ingress is the bound) -> off
+#endif
+#ifndef TPB2_ARV
+#define TPB2_ARV 0   // all-reduce variants (bits, same arithmetic -> bitwise): 1 T3 polls of a thread's messages in flight together; 2 T2 + T3 in
+                     // one poll loop (a thread's T2 sources and T3 messages in flight together, T3 never waits behind the CTA's T2); 4 no fence
+                     // before the end-of-kernel epoch count; 8 explicit in-flight source polls (issue all pending loads, then test -- the
+                     // pending-mask loop compiled to 4 dependent L2 round trips per poll); 16 one-shot: each pair received by the warp that
+                     // T1'd it (no local copy, no CTA-wide receive); 32 epoch from a u64 CTA-exit count (red, no fence / returning atomic at
+                     // exit).  Paired (KS vs KS2, us): 8 M8 -0.37 / M32 -0.43 / M128 -0.4; 4 M8 -0.53 / M128 -0.67; 32 vs 4 M8 -0.5 / M128
+                     // -0.6; 2 M64 -0.5 / M128 -0.9; 1 M128 -0.35; 16 M1 0 / M8 0 / M4 +0.55 (off).  v77: 40 one-shot builds, 34 RS + AG
 #endif
 #ifndef TPB2_IDPRE
 #define TPB2_IDPRE 0   // build_tables (M > SMALLM): the global ids loaded into registers before the clear phase (one L2 round trip hidden)
@@ -400,6 +442,22 @@ __device__ __forceinline__ void dly_spin(unsigned ns) {
 #ifndef TPB2_GRID
 #define TPB2_GRID 0   // > 0: the grid (CTAs) fixed at compile time (the host checks; divisions by G fold to multiplies)
 #endif
+#ifndef TPB2_SFBI
+#define TPB2_SFBI 0   // 1: routed FC1 x scales (SFB) staged per ITEM (two item buffers [16 stages][32 rows][16 B] after the tables) in
+                      // batches of 4 stages with ONE proxy fence per batch, instead of a generic store + proxy fence per stage on the B
+                      // warp (probe 128: those cost ~7% of the FC1 phase at M128).  The MMA warp copies stage s of item buffer (item & 1).
+#endif
+#ifndef TPB2_SFBI_SB
+#define TPB2_SFBI_SB 4   // (SFBI) stages per batch (4 x 16-B rows in registers per lane, x2 with the next batch in flight)
+#endif
+#ifndef TPB2_SHPOL
+#define TPB2_SHPOL 0   // L2 policy of the SHARED expert weight TMA loads (re-streamed per 32-token panel at M > 32): 0 evict_first (as the
+                       // routed weights), 1 evict_normal, 2 evict_last -- the panels' concurrent re-reads of a tile can then hit L2
+#endif
+#ifndef TPB2_RRB
+#define TPB2_RRB 0   // 1: in-kernel router for M > 64 in 64-row blocks (units = 16 expert groups x K-parts x row blocks; each row's K16
+                     // chain unchanged -> logits still == cuBLAS's split-K bitwise; x per unit halved at M128)
+#endif
 #ifndef TPB2_RANK
 #define TPB2_RANK -1   // >= 0: this build serves TP rank TPB2_RANK only (the host checks): peer indexing at compile time
 #endif
@@ -472,8 +530,11 @@ constexpr int TAB_BAR = TAB_RING + WR * 16;            // uint64 barriers
 constexpr int NBAR = 4 * NS + 2 * ACC + 2 * WR + 4 + 6 + 4;   // (+ 4 H1U: h buffer 0 / 1 full, empty)   // (+ 6 in-kernel router: W, x buffer 0, MMA done, x buffer 1, buffer 0 / 1 free)   // (+ NS PAIR FULLP: the peer's stage arrivals, forwarded; + 4 CSPLIT MFULL / MEMPTY)
 constexpr int TAB_MBUF = (TAB_BAR + NBAR * 8 + 15) & ~15;   // float [2][NMAX][128] CSPLIT: the cluster peer's FC1 partials (rank 0)
 constexpr int TAB_BYTES = TAB_MBUF + (TPB2_CSPLIT ? 2 * NMAX * 128 * 4 : 0);
-constexpr int SMEM_TOTAL = OFF_TAB + TAB_BYTES, SMEM_ALLOC = SMEM_TOTAL + 1024;
+constexpr int OFF_SFBI = (OFF_TAB + TAB_BYTES + 1023) & ~1023;   // (TPB2_SFBI) uint8 [2][NSTG1][512] routed FC1 SFB images per item
+constexpr int SFBI_BYTES = TPB2_SFBI ? 2 * NSTG1 * 512 : 0;
+constexpr int SMEM_TOTAL = (TPB2_SFBI ? OFF_SFBI + SFBI_BYTES : OFF_TAB + TAB_BYTES), SMEM_ALLOC = SMEM_TOTAL + 1024;
 static_assert(SMEM_ALLOC <= 232448, "smem budget");
+static_assert(!TPB2_SFBI || (TPB2_LEANMMA == 2 && !TPB2_MPAIR && !TPB2_FC1PAIR && !TPB2_PAIR && TPB2_GATHER && TPB2_SFCP_MMA), "SFBI: the lean 1-CTA gather path");
 static_assert(!(TPB2_DBG && TPB2_TRACE), "the dbg_ buffer is either the stamps or the xtrace buffer");
 static_assert(!(TPB2_LASTM && TPB2_T1W), "TPB2_LASTM counts shared quarters in P.tcnt (the T1W counters)");
 static_assert(!TPB2_RRTAIL && !TPB2_PF && !TPB2_PF2 && !TPB2_PF1, "removed in v36");
@@ -526,6 +587,8 @@ struct Params {
     __nv_bfloat16* outp;                     // [MAXM][TOPK_MAX][4096] per-slot expert outputs
     uint4* rs[NDEV];                         // peer reduce-scatter buffers (two parity halves)
     uint4* ag[NDEV];                         // peer all-gather buffers (two parity halves)
+    uint4* rsmc;                             // (TPB2_MC) NVLS multicast address of the rs buffers (a store reaches all ranks), or null
+    uint4* agmc;                             // (TPB2_MC) multicast address of the ag buffers, or null
     __nv_bfloat16* out;                      // [M][4096]
     int M, my_rank, ndev, oneshot;
     // fused shared expert (shw): the production FP8 DeepseekV2MLP slice in place (DeepGEMM numerics: per-128 UE8M0 scales)
@@ -545,6 +608,7 @@ struct Params {
     CUtensorMap maprx, maprw;                // x bf16 {64, M, 64 chunks} box {64, R, rch}; router W bf16 {64, 256, 64} box {64, 16, rch} (SW128)
     float* rpart;                            // [rS][M][256] fp32 K-part logits (= glog; the gate sums them in order)
     int rS, rR, rch, rk0[4], rkn[4];         // parts, x rows R (M rounded to 8), box chunks (longest part)
+    int rB;                                  // (TPB2_RRB) 64-row blocks (1 otherwise)
     int rxch;                                // x chunks per TMA load (< rch: double-buffered x sub-parts, M 33..64)
     // in-kernel dsv3 router (rF; M <= 4): production's sglang dsv3_router_gemm (FMA chains) bit for bit, logits -> rpart [M][256]
     const __nv_bfloat16* rwf;                // router W bf16 [256][4096]
@@ -578,10 +642,11 @@ __device__ __forceinline__ void mbar_wait_cl(uint32_t b, uint32_t parity) {   //
 __device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
     asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
 }
-__device__ __forceinline__ void tma3d(uint32_t dst, const CUtensorMap* map, int c0, int c1, int c2, uint32_t bar) {
+__device__ __forceinline__ void tma3d(uint32_t dst, const CUtensorMap* map, int c0, int c1, int c2, uint32_t bar, uint64_t hint = 0x12F0000000000000ull) {
     asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                 ::"r"(dst), "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(bar), "l"(0x12F0000000000000ull) : "memory");
+                 ::"r"(dst), "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(bar), "l"(hint) : "memory");
 }
+constexpr uint64_t SH_HINT = TPB2_SHPOL == 2 ? 0x14F0000000000000ull : (TPB2_SHPOL == 1 ? 0x1000000000000000ull : 0x12F0000000000000ull);
 // PAIR: the peer's weight tile, its completion counted on the leader's barrier (cluster address)
 __device__ __forceinline__ void tma3d_cg2(uint32_t dst, const CUtensorMap* map, int c0, int c1, int c2, uint32_t cluster_bar) {
     asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -642,6 +707,10 @@ __device__ __forceinline__ void named_bar(int id, int n) { asm volatile("bar.syn
 __device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void griddep_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 __device__ __forceinline__ void st_ll(uint4* p, uint4 v) { asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1,%2,%3,%4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory"); }
+__device__ __forceinline__ void st_mc(uint4* p, uint4 v) {   // NVLS multicast store: the switch writes the 16 B to every rank's buffer
+    asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(p), "f"(__uint_as_float(v.x)), "f"(__uint_as_float(v.y)),
+                 "f"(__uint_as_float(v.z)), "f"(__uint_as_float(v.w)) : "memory");
+}
 __device__ __forceinline__ uint4 ld_ll(const uint4* p) { uint4 v; asm volatile("ld.relaxed.sys.global.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory"); return v; }
 __device__ __forceinline__ bool elect_one() {
     uint32_t pred = 0;
@@ -1288,19 +1357,20 @@ __device__ __forceinline__ void t1_load(const Params& P, const Tabs& T, bool sma
     // every load issued at once: slots past topk / invalid ids are loaded but masked off; small fused gate: ids / weights from smem
     in.sh = make_uint4(0u, 0u, 0u, 0u);
     const __nv_bfloat16* shp = pSHW(P) ? P.shout : pSHD(P);
-    if (shp) in.sh = ld_v4_last_use(shp + static_cast<size_t>(t) * DIM + c0);
+    if (shp && !(TPB2_PROBE & 2048)) in.sh = ld_v4_last_use(shp + static_cast<size_t>(t) * DIM + c0);
 #pragma unroll
     for (int k = 0; k < TOPK_MAX; ++k) {
         if (k < topk) {
             in.idk[k] = small_rw ? static_cast<int>(T.sids[t * topk + k]) : __ldcg(P.ids + t * topk + k);
             in.wk[k] = small_rw ? T.srw[t * topk + k] : __ldcg(P.rw + t * topk + k);
-            in.v[k] = ld_v4_last_use(P.outp + (static_cast<size_t>(t) * TOPK_MAX + k) * OUTP_LD + c0);
+            in.v[k] = (TPB2_PROBE & 2048) ? make_uint4(0u, 0u, 0u, 0u) : ld_v4_last_use(P.outp + (static_cast<size_t>(t) * TOPK_MAX + k) * OUTP_LD + c0);
         } else {
             in.idk[k] = -1; in.wk[k] = 0.f; in.v[k] = make_uint4(0u, 0u, 0u, 0u);
         }
     }
 }
-__device__ __forceinline__ void t1_emit(const Params& P, int rtile, int t, unsigned epoch, __nv_bfloat16* stg, int lane, const T1In& in, Xt* xt) {
+__device__ __forceinline__ void t1_emit(const Params& P, int rtile, int t, unsigned epoch, __nv_bfloat16* stg, int lane, const T1In& in, Xt* xt,
+                                        bool noself = false) {   // (noself: this warp receives the pair itself, its own copy stays in stg)
     unsigned on = 0u;
     float wk[TOPK_MAX];
 #pragma unroll
@@ -1341,8 +1411,15 @@ __device__ __forceinline__ void t1_emit(const Params& P, int rtile, int t, unsig
             o[0] = msg.x; o[1] = msg.y;
             if (full6) o[2] = msg.z;
         } else if (pOS(P)) {
+            if (TPB2_MC & 1) st_mc(P.rsmc + (epoch & 1u) * RS_PAR + os_idx(pRK(P), rtile, t, m), msg);
+            else if (TPB2_MC & 4) {   // multicast to all + this rank's own copy by a local store (it lands at once; the switch's copy
+                                      // of the same bytes lands later, harmlessly)
+                st_mc(P.rsmc + (epoch & 1u) * RS_PAR + os_idx(pRK(P), rtile, t, m), msg);
+                if (!noself) st_ll(P.rs[pRK(P)] + (epoch & 1u) * RS_PAR + os_idx(pRK(P), rtile, t, m), msg);
+            } else {
 #pragma unroll
-            for (int d = 0; d < NDEV; ++d) st_ll(P.rs[(pRK(P) + d) & (NDEV - 1)] + (epoch & 1u) * RS_PAR + os_idx(pRK(P), rtile, t, m), msg);
+                for (int d = noself ? 1 : 0; d < NDEV; ++d) st_ll(P.rs[(pRK(P) + d) & (NDEV - 1)] + (epoch & 1u) * RS_PAR + os_idx(pRK(P), rtile, t, m), msg);
+            }
         } else {
             st_ll(P.rs[TPB2_PROBE_T1LOCAL ? pRK(P) : rtile / LRT] + (epoch & 1u) * RS_PAR + rs_idx(pRK(P), rtile % LRT, t, m), msg);
         }
@@ -1356,6 +1433,49 @@ __device__ __forceinline__ void t1_pair(const Params& P, const Tabs& T, bool sma
     T1In in;
     t1_load(P, T, small_rw, rtile, t, lane, in);
     t1_emit(P, rtile, t, epoch, stg, lane, in, xt);
+}
+
+// ARV 16 (one-shot, TCH <= warps): the T1 warp receives its own pair right after its sends -- own copy from stg (no local store / reload), the three peers' messages of lanes l, l + 32 polled in flight together, the
+// same rank-order fp32 sum as the one-shot receive
+__device__ __forceinline__ void os_recv_own(const Params& P, int rtile, int t, unsigned epoch, const __nv_bfloat16* stg, int lane) {
+    const uint4* rs_me = P.rs[pRK(P)] + (epoch & 1u) * RS_PAR;
+    const int me = pRK(P), m0 = lane, m1 = lane + 32;
+    const bool h1 = m1 < NMSG;
+    uint4 v0[NDEV], v1[NDEV];
+    unsigned p0 = ((1u << NDEV) - 1u) & ~(1u << me), p1 = h1 ? p0 : 0u;
+    while (p0 | p1) {
+        const unsigned q0 = p0, q1 = p1;
+#pragma unroll
+        for (int d = 0; d < NDEV; ++d) if (q0 & (1u << d)) v0[d] = ld_ll(rs_me + os_idx(d, rtile, t, m0));
+#pragma unroll
+        for (int d = 0; d < NDEV; ++d) if (q1 & (1u << d)) v1[d] = ld_ll(rs_me + os_idx(d, rtile, t, m1));
+#pragma unroll
+        for (int d = 0; d < NDEV; ++d) {
+            if ((q0 & (1u << d)) && v0[d].w == epoch) p0 &= ~(1u << d);
+            if ((q1 & (1u << d)) && v1[d].w == epoch) p1 &= ~(1u << d);
+        }
+    }
+    const uint32_t* w0 = reinterpret_cast<const uint32_t*>(stg + 6 * m0);
+    const uint32_t* w1 = reinterpret_cast<const uint32_t*>(stg + 6 * (h1 ? m1 : m0));
+    const uint4 o0 = make_uint4(w0[0], w0[1], w0[2], epoch), o1 = make_uint4(w1[0], w1[1], m1 < NMSG - 1 ? w1[2] : 0u, epoch);
+#pragma unroll
+    for (int d = 0; d < NDEV; ++d) if (d == me) { v0[d] = o0; v1[d] = o1; }
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        if (h == 1 && !h1) break;
+        const uint4* v = h ? v1 : v0;
+        const int m = h ? m1 : m0;
+        float a[6] = {bf16lo(v[0].x), bf16hi(v[0].x), bf16lo(v[0].y), bf16hi(v[0].y), bf16lo(v[0].z), bf16hi(v[0].z)};
+#pragma unroll
+        for (int d = 1; d < NDEV; ++d) {
+            a[0] = __fadd_rn(a[0], bf16lo(v[d].x)); a[1] = __fadd_rn(a[1], bf16hi(v[d].x));
+            a[2] = __fadd_rn(a[2], bf16lo(v[d].y)); a[3] = __fadd_rn(a[3], bf16hi(v[d].y));
+            a[4] = __fadd_rn(a[4], bf16lo(v[d].z)); a[5] = __fadd_rn(a[5], bf16hi(v[d].z));
+        }
+        uint32_t* o = reinterpret_cast<uint32_t*>(P.out + static_cast<size_t>(t) * DIM + rtile * 256 + 6 * m);
+        o[0] = pack_bf16x2(a[0], a[1]); o[1] = pack_bf16x2(a[2], a[3]);
+        if (m < NMSG - 1) o[2] = pack_bf16x2(a[4], a[5]);
+    }
 }
 
 // T1LL: (row tile rtile, token t) from the LL images (small fused gate: ids / weights in smem): lane l polls messages l, l + 32 of the 44 per
@@ -1444,6 +1564,9 @@ __device__ void tail(const Params& P, const Tabs& T, bool small_rw, int tid, uns
     const int ntc = (M + TCH - 1) / TCH, nitem = NRT * ntc;
     volatile int* s_item = reinterpret_cast<volatile int*>(T.misc + 8);
     unsigned done_rt = 0u, done_it = 0u;
+    // ARV 16 (one-shot, every item's tokens on distinct warps: TCH <= warps): each pair is received on every rank by the warp that T1'd
+    // it there, right after its sends (os_recv_own); the CTA-wide receive below is skipped
+    const bool fused = (TPB2_ARV & 16) && TCH <= THREADS / 32 && pND(P) > 1 && pOS(P) && !fc2l_on(P) && !TPB2_PROBE_T1LOCAL;
     if (TPB2_T1W && TPB2_SFCP_MMA) {   // the pairs warp 7 left open: one warp each, waiting for its FC2 count
         const unsigned long long left = static_cast<unsigned long long>(static_cast<unsigned>(T.misc[12])) |
                                         (static_cast<unsigned long long>(static_cast<unsigned>(T.misc[13])) << 32);
@@ -1491,8 +1614,9 @@ __device__ void tail(const Params& P, const Tabs& T, bool small_rw, int tid, uns
             t1_load(P, T, small_rw, rtile, t0 + tt, tid & 31, ia);
             const bool two = tt + NW < nt;
             if (two) t1_load(P, T, small_rw, rtile, t0 + tt + NW, tid & 31, ib);
-            t1_emit(P, rtile, t0 + tt, epoch, stg, tid & 31, ia, xp);
+            t1_emit(P, rtile, t0 + tt, epoch, stg, tid & 31, ia, xp, fused);
             if (two) t1_emit(P, rtile, t0 + tt + NW, epoch, stg, tid & 31, ib, nullptr);
+            if (fused) os_recv_own(P, rtile, t0 + tt, epoch, stg, tid & 31);   // (TCH <= warps: never two)
         }
         if (tid == 0) xt.rec(XT_END(52));
     }
@@ -1500,6 +1624,7 @@ __device__ void tail(const Params& P, const Tabs& T, bool small_rw, int tid, uns
     if (tid == 0) xt.rec(XT_BEG(55));
     if (pND(P) == 1) return;
     if (TPB2_PROBE_T1LOCAL) return;   // (probe: no all-reduce -- wrong output)
+    if (fused) return;
     if (pOS(P)) {
         const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
         const uint4* rs_me = P.rs[pRK(P)] + (epoch & 1u) * RS_PAR;
@@ -1509,6 +1634,15 @@ __device__ void tail(const Params& P, const Tabs& T, bool small_rw, int tid, uns
             const int pi = x / nm, m = x - pi * nm, j = b + pi * G, rtile = j / M, t = j - rtile * M;
             uint4 v[NDEV];
             unsigned pending = (1u << NDEV) - 1u;
+            if (TPB2_ARV & 8) {
+                do {
+                    const unsigned p0 = pending;
+#pragma unroll
+                    for (int d = 0; d < NDEV; ++d) if (p0 & (1u << d)) v[d] = ld_ll(rs_me + os_idx(d, rtile, t, m));
+#pragma unroll
+                    for (int d = 0; d < NDEV; ++d) if ((p0 & (1u << d)) && v[d].w == epoch) pending &= ~(1u << d);
+                } while (pending);
+            } else
             do {
 #pragma unroll
                 for (int d = 0; d < NDEV; ++d)
@@ -1529,6 +1663,67 @@ __device__ void tail(const Params& P, const Tabs& T, bool small_rw, int tid, uns
         }
         return;
     }
+    if (TPB2_ARV & 2) {   // T2 + T3 in one poll loop: a thread's <= 1 T2 message (4 sources) and <= 4 T3 messages in flight together
+        const int n2 = (b < LRT * M ? (LRT * M - b + G - 1) / G : 0) * NMSG, n3 = (b < NRT * M ? (NRT * M - b + G - 1) / G : 0) * NMSG;
+        if (n2 <= THREADS && n3 <= 4 * THREADS) {
+            const uint4* rs_me = P.rs[pRK(P)] + (epoch & 1u) * RS_PAR;
+            const uint4* ag_me = P.ag[pRK(P)] + (epoch & 1u) * AG_PAR;
+            unsigned p2 = 0u, p3 = 0u;
+            size_t a2 = 0, a3[4];
+            int lrt = 0, t2 = 0, m2 = 0;
+            if (tid < n2) {
+                const int pi = tid / NMSG, j = b + pi * G;
+                m2 = tid - pi * NMSG; lrt = j / M; t2 = j - lrt * M;
+                a2 = rs_idx(0, lrt, t2, m2); p2 = (1u << NDEV) - 1u;
+            }
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int x = tid + k * THREADS;
+                a3[k] = 0;
+                if (x < n3) {
+                    const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
+                    a3[k] = ag_idx(rtile, t, m); p3 |= 1u << k;
+                }
+            }
+            constexpr size_t RS_SRC = static_cast<size_t>(LRT) * MAXM * NMSG;   // rs_idx(d + 1, ...) - rs_idx(d, ...)
+            uint4 v2[NDEV], v3[4];
+            while (p2 | p3) {
+                const unsigned q2 = p2, q3 = p3;
+#pragma unroll
+                for (int d = 0; d < NDEV; ++d) if (q2 & (1u << d)) v2[d] = ld_ll(rs_me + a2 + d * RS_SRC);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) if (q3 & (1u << k)) v3[k] = ld_ll(ag_me + a3[k]);
+#pragma unroll
+                for (int d = 0; d < NDEV; ++d) if ((q2 & (1u << d)) && v2[d].w == epoch) p2 &= ~(1u << d);
+                if (q2 && !p2) {   // all four sources in: reduce in rank order, all-gather push
+                    float a[6] = {bf16lo(v2[0].x), bf16hi(v2[0].x), bf16lo(v2[0].y), bf16hi(v2[0].y), bf16lo(v2[0].z), bf16hi(v2[0].z)};
+#pragma unroll
+                    for (int d = 1; d < NDEV; ++d) {
+                        a[0] = __fadd_rn(a[0], bf16lo(v2[d].x)); a[1] = __fadd_rn(a[1], bf16hi(v2[d].x));
+                        a[2] = __fadd_rn(a[2], bf16lo(v2[d].y)); a[3] = __fadd_rn(a[3], bf16hi(v2[d].y));
+                        a[4] = __fadd_rn(a[4], bf16lo(v2[d].z)); a[5] = __fadd_rn(a[5], bf16hi(v2[d].z));
+                    }
+                    const uint4 mo = make_uint4(pack_bf16x2(a[0], a[1]), pack_bf16x2(a[2], a[3]), pack_bf16x2(a[4], a[5]), epoch);
+                    const size_t ai = ag_idx(pRK(P) * LRT + lrt, t2, m2);
+                    if (TPB2_MC & 2) st_mc(P.agmc + (epoch & 1u) * AG_PAR + ai, mo);
+                    else {
+#pragma unroll
+                        for (int d = 0; d < NDEV; ++d) st_ll(P.ag[d] + (epoch & 1u) * AG_PAR + ai, mo);
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    if ((q3 & (1u << k)) && v3[k].w == epoch) {
+                        p3 &= ~(1u << k);
+                        const int x = tid + k * THREADS, pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
+                        uint32_t* o = reinterpret_cast<uint32_t*>(P.out + static_cast<size_t>(t) * DIM + rtile * 256 + 6 * m);
+                        o[0] = v3[k].x; o[1] = v3[k].y;
+                        if (m < NMSG - 1) o[2] = v3[k].z;
+                    }
+            }
+            return;
+        }
+    }
     {   // T2: owner reduce in rank order, all-gather push
         const int npair = LRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
         const uint4* rs_me = P.rs[pRK(P)] + (epoch & 1u) * RS_PAR;
@@ -1536,6 +1731,15 @@ __device__ void tail(const Params& P, const Tabs& T, bool small_rw, int tid, uns
             const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, lrt = j / M, t = j - lrt * M;
             uint4 v[NDEV];
             unsigned pending = (1u << NDEV) - 1u;
+            if (TPB2_ARV & 8) {
+                do {
+                    const unsigned p0 = pending;
+#pragma unroll
+                    for (int d = 0; d < NDEV; ++d) if (p0 & (1u << d)) v[d] = ld_ll(rs_me + rs_idx(d, lrt, t, m));
+#pragma unroll
+                    for (int d = 0; d < NDEV; ++d) if ((p0 & (1u << d)) && v[d].w == epoch) pending &= ~(1u << d);
+                } while (pending);
+            } else
             do {
 #pragma unroll
                 for (int d = 0; d < NDEV; ++d)
@@ -1550,13 +1754,48 @@ __device__ void tail(const Params& P, const Tabs& T, bool small_rw, int tid, uns
             }
             const uint4 mo = make_uint4(pack_bf16x2(a[0], a[1]), pack_bf16x2(a[2], a[3]), pack_bf16x2(a[4], a[5]), epoch);
             const int rtile = pRK(P) * LRT + lrt;
+            if (TPB2_MC & 2) st_mc(P.agmc + (epoch & 1u) * AG_PAR + ag_idx(rtile, t, m), mo);
+            else {
 #pragma unroll
-            for (int d = 0; d < NDEV; ++d) st_ll(P.ag[d] + (epoch & 1u) * AG_PAR + ag_idx(rtile, t, m), mo);
+                for (int d = 0; d < NDEV; ++d) st_ll(P.ag[d] + (epoch & 1u) * AG_PAR + ag_idx(rtile, t, m), mo);
+            }
         }
     }
     {   // T3: pull the reduced rows
         const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
         const uint4* ag_me = P.ag[pRK(P)] + (epoch & 1u) * AG_PAR;
+        if (TPB2_ARV & 1) {   // a thread's (up to 4) messages polled in flight together
+            const int tot = mine * NMSG;
+            for (int x0 = tid; x0 < tot; x0 += 4 * THREADS) {
+                unsigned p3 = 0u;
+                size_t a3[4];
+                uint4 v3[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int x = x0 + k * THREADS;
+                    a3[k] = 0;
+                    if (x < tot) {
+                        const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
+                        a3[k] = ag_idx(rtile, t, m); p3 |= 1u << k;
+                    }
+                }
+                while (p3) {
+                    const unsigned q3 = p3;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) if (q3 & (1u << k)) v3[k] = ld_ll(ag_me + a3[k]);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+                        if ((q3 & (1u << k)) && v3[k].w == epoch) {
+                            p3 &= ~(1u << k);
+                            const int x = x0 + k * THREADS, pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
+                            uint32_t* o = reinterpret_cast<uint32_t*>(P.out + static_cast<size_t>(t) * DIM + rtile * 256 + 6 * m);
+                            o[0] = v3[k].x; o[1] = v3[k].y;
+                            if (m < NMSG - 1) o[2] = v3[k].z;
+                        }
+                }
+            }
+            return;
+        }
         for (int x = tid; x < mine * NMSG; x += THREADS) {
             const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
             uint4 v;
@@ -1676,7 +1915,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 if (shh >= 0) {   // (SHGU: chunks 2 j, 2 j + 1 of this CTA's gate or up rows + their scales -- a full 32 KB slot)
                     mbar_expect_tx(bar(B_FULL + j), 2 * 16384 + 2 * 512);
                     for (int h2 = 0; h2 < 2; ++h2) {
-                        tma3d(sb + OFF_A + j * A_BYTES + h2 * 16384, &P.map1s, 0, shh * INTER + 128 * k, 2 * j + h2, bar(B_FULL + j));
+                        tma3d(sb + OFF_A + j * A_BYTES + h2 * 16384, &P.map1s, 0, shh * INTER + 128 * k, 2 * j + h2, bar(B_FULL + j), SH_HINT);
                         bulk_g2s(sb + OFF_SFA + j * KC * 512 + h2 * 512, P.sfa1s + (static_cast<size_t>(shh * (INTER / 128) + k) * NCH1 + 2 * j + h2) * 512, 512, bar(B_FULL + j));
                     }
                     continue;
@@ -1686,8 +1925,8 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                     tma3d_cg2(sb + OFF_A + j * A_BYTES, &P.map1s, 0, 128 * k, c0 + j, full_lead + 8 * j);
                     tma3d_cg2(sb + OFF_A + j * A_BYTES + 16384, &P.map1s, 0, INTER + 128 * k, c0 + j, full_lead + 8 * j);
                 } else {
-                    tma3d(sb + OFF_A + j * A_BYTES, &P.map1s, 0, 128 * k, c0 + j, bar(B_FULL + j));
-                    tma3d(sb + OFF_A + j * A_BYTES + 16384, &P.map1s, 0, INTER + 128 * k, c0 + j, bar(B_FULL + j));
+                    tma3d(sb + OFF_A + j * A_BYTES, &P.map1s, 0, 128 * k, c0 + j, bar(B_FULL + j), SH_HINT);
+                    tma3d(sb + OFF_A + j * A_BYTES + 16384, &P.map1s, 0, INTER + 128 * k, c0 + j, bar(B_FULL + j), SH_HINT);
                 }
                 bulk_g2s(sb + OFF_SFA + j * KC * 512, P.sfa1s + (static_cast<size_t>(k) * NCH1 + c0 + j) * 512, 512, bar(B_FULL + j));
                 bulk_g2s(sb + OFF_SFA + j * KC * 512 + 512, P.sfa1s + (static_cast<size_t>(INTER / 128 + k) * NCH1 + c0 + j) * 512, 512, bar(B_FULL + j));
@@ -1697,13 +1936,13 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
     }
     // in-kernel router unit u = G - 1 - b (part u / 16, experts 16 (u % 16) ..): its W slice (static) loaded before the PDL wait
     const int ru = G - 1 - b;
-    const bool rcta = pRS(P) > 0 && ru < 16 * pRS(P);
+    const bool rcta = pRS(P) > 0 && ru < 16 * pRS(P) * (TPB2_RRB ? P.rB : 1);
     constexpr uint32_t RW_OFF = 96 * 1024;   // (x rows: [0, rch R 128 + slack); W rows [96 KB, + rch 2 KB): ring A / B stages, dead until the tables)
     if (rcta) {
         __syncthreads();   // (the barrier inits)
         if (tid == 0) {
             mbar_expect_tx(bar(B_RW), static_cast<uint32_t>(P.rch) * 2048u);
-            tma3d(sb + RW_OFF, &P.maprw, 0, 16 * (ru % 16), P.rk0[ru / 16] / 64, bar(B_RW));
+            tma3d(sb + RW_OFF, &P.maprw, 0, 16 * (ru % 16), P.rk0[(ru / 16) % pRS(P)] / 64, bar(B_RW));   // (RRB: units ru / 16 / S = row block)
         }
     }
     // in-kernel dsv3 router (rF): expert 3 ru + g on CTA G - 1 - ru, thread group g = warps 4 g .. 4 g + 3 in the dsv3 CTA's layout
@@ -1739,7 +1978,10 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
     }
     if (tid == 0) xt.rec(XT_BEG(2));
     griddep_wait();
-    const unsigned epoch = __ldcg(P.work) + 1u, par = epoch & 1u;
+    // (ARV 32: epoch = completed calls + 1 from the u64 CTA-exit count work[2..3] (+ G per call), no last-CTA detection at exit)
+    const unsigned epoch = (TPB2_ARV & 32) ? static_cast<unsigned>(__ldcg(reinterpret_cast<const unsigned long long*>(P.work + 2)) /
+                                                                   static_cast<unsigned long long>(G)) + 1u
+                                           : __ldcg(P.work) + 1u, par = epoch & 1u;
     if (DBGP && tid == 0) DBGP[b * 32 + 26] = gtime();
     if (tid == 0) xt.rec(XT_END(2));
     if (TPB2_T1W)   // (every CTA a slice) the next launch's T1 counters
@@ -1749,7 +1991,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
         for (int i = tid; i < MAXP + 32; i += THREADS) P.rdy[(par ^ 1u) * (MAXP + 32) + i] = 0u;
         for (int i = tid; i < MAXM; i += THREADS) P.xflag[(par ^ 1u) * MAXM + i] = 0u;
         if (tid < NRT) P.rt_cnt[(par ^ 1u) * NRT + tid] = 0u;
-        if (tid == NRT) P.work[1 + (par ^ 1u)] = 0u;
+        if (tid == NRT && !(TPB2_ARV & 32)) P.work[1 + (par ^ 1u)] = 0u;
         if (tid == NRT + 1) { P.fc2_next[par ^ 1u] = 0u; P.fc2_next[2 + (par ^ 1u)] = 0u; P.gcnt[par ^ 1u] = 0u; }
         if (TPB2_LASTM) for (int i = tid; i < 256; i += THREADS) P.tcnt[(par ^ 1u) * MAXM * NRT + i] = 0u;   // (LASTM counters)
         if (tid == 0) P.tcnt[(par ^ 1u) * MAXM * NRT + 300] = 0u;   // (in-kernel router units done)
@@ -1759,7 +2001,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
     if (rcta && tid == 0) xt.rec(XT_BEG(76));
     if (rcta) {   // ---- in-kernel router unit: x part (rows < M real; rows R..63 of a chunk's 64-row tile alias the next chunk: their D rows are
                   // not used), kind::f16 K16 chain in K order (== the cuBLAS K-part), D [64 tokens][16 experts] -> rpart, counted
-        const int rp = ru / 16, eg = ru % 16, nch = P.rkn[rp] / 64, R = P.rR;
+        const int rp = (ru / 16) % pRS(P), eg = ru % 16, nch = P.rkn[rp] / 64, R = P.rR, rb = TPB2_RRB ? ru / (16 * pRS(P)) : 0;   // (rows 64 rb ..)
         __syncthreads();   // (TMEM address)
         tc_fence_after();
         const uint32_t rtm = static_cast<uint32_t>(T.misc[3]) + 3 * ACC_COLS;   // (accumulator buffer 3: unused until the role split)
@@ -1771,7 +2013,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
             for (int j = 0; j < nsub; ++j) {
                 if (j >= 2) mbar_wait(bar((j & 1) ? B_RF1 : B_RF0), static_cast<uint32_t>((j - 2) >> 1) & 1u);   // (the MMAs of sub-part j - 2 done)
                 mbar_expect_tx(bar((j & 1) ? B_RX1 : B_RX), XB);
-                tma3d(sb + (j & 1) * XB, &P.maprx, 0, 0, P.rk0[rp] / 64 + j * rxch, bar((j & 1) ? B_RX1 : B_RX));
+                tma3d(sb + (j & 1) * XB, &P.maprx, 0, 64 * rb, P.rk0[rp] / 64 + j * rxch, bar((j & 1) ? B_RX1 : B_RX));
             }
         }
         if (warp == 1) {
@@ -1804,7 +2046,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
             tc_fence_after();
             float rv[16];
             tc_ld16_wait(rtm + (static_cast<uint32_t>(32 * q) << 16), rv);
-            const int t = (R > 64 ? 32 : 16) * q + lane;
+            const int t = (R > 64 ? 32 : 16) * q + lane + 64 * rb;
             if ((R > 64 || lane < 16) && t < M) {
                 float* dst = P.rpart + (static_cast<size_t>(rp) * M + t) * NEXP + 16 * eg;
 #pragma unroll
@@ -1861,7 +2103,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
     }
     if ((pRS(P) > 0 || pRF(P)) && tid == 0) xt.rec(XT_BEG(77));
     if (pRS(P) > 0 || pRF(P)) {   // every router unit's K-part logits in (acquire), before the gate reads them
-        if (tid == 0) wait_ge(P.tcnt + par * MAXM * NRT + 300, static_cast<unsigned>(pRF(P) ? NEXP : 16 * pRS(P)));
+        if (tid == 0) wait_ge(P.tcnt + par * MAXM * NRT + 300, static_cast<unsigned>(pRF(P) ? NEXP : 16 * pRS(P) * (TPB2_RRB ? P.rB : 1)));
         __syncthreads();
         if (tid == 0) xt.rec(XT_END(77));
     }
@@ -1979,12 +2221,51 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
         }
         __syncwarp();
     }
+    if (TPB2_RPRE && small && warp == 7 && lane == 0) {   // ---- RPRE: the first routed piece's first stages, from the gate ids
+        static_assert(!TPB2_RPRE || (TPB2_SHEARLY && TPB2_RPRE <= TPB2_SHPRE && TPB2_RPRE <= NS && TPB2_RRSPLIT == 1 && TPB2_SHW1 && TPB2_PUT1
+                                     && !TPB2_PAIR && !TPB2_CSPLIT && TPB2_RR && TPB2_RR_MIN4 == 0), "RPRE: stages 0.. free in the prologue, rr PUT1 order");
+        int npr = 0;
+        const int r = pb - nshq0;   // (rr, PUT1, SHW1 waves: unit pb >= nshq starts with routed item pb - nshq, stages 0 ..)
+        if (r >= 0) {
+            const int MT = M * pTK(P);
+            uint32_t wv[8];
+#pragma unroll
+            for (int w = 0; w < 8; ++w) wv[w] = 0u;
+            for (int i = 0; i < MT; ++i) {
+                const int e = gids[i];
+                if (static_cast<unsigned>(e) < static_cast<unsigned>(NEXP)) {
+#pragma unroll
+                    for (int w = 0; w < 8; ++w) if ((e >> 5) == w) wv[w] |= 1u << (e & 31);
+                }
+            }
+            int Pt = 0;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) Pt += __popc(wv[w]);
+            if (r < Pt * NT1U) {
+                int pr = r / NT1U, e = -1;   // the pr-th present expert (panel pr)
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    const int c = __popc(wv[w]);
+                    if (e < 0 && pr < c) { uint32_t m2 = wv[w]; for (int i = 0; i < pr; ++i) m2 &= m2 - 1u; e = 32 * w + __ffs(m2) - 1; }
+                    else if (e < 0) pr -= c;
+                }
+                const int tile = r % NT1U;
+                npr = TPB2_RPRE;
+                for (int j = 0; j < npr; ++j) {
+                    mbar_expect_tx(bar(B_FULL + j), KC * 8192 + KC * 512);
+                    tma3d(sb + OFF_A + j * A_BYTES, &P.map1, 0, e * (2 * INTER) + tile * 128, KC * j, bar(B_FULL + j), 0x12F0000000000000ull);
+                    bulk_g2s(sb + OFF_SFA + j * KC * 512, P.w13_sf + ((static_cast<size_t>(e) * NT1 + tile) * NCH1 + KC * j) * 512, KC * 512, bar(B_FULL + j));
+                }
+            }
+        }
+        T.misc[30] = npr;   // (the producer skips these fills; read after the role split)
+    }
     unsigned xv[16];   // (warp 6, TPB2_GATHER) every token's x flag, acquire-loaded here: in flight over the tables, checked after the role split
     if (TPB2_GATHER && warp == 6) {
 #pragma unroll
         for (int i = 0; i < 16; ++i)
             xv[i] = lane + 32 * i < M ? (TPB2_XRLX ? ld_relaxed(P.xflag + par * MAXM + lane + 32 * i) : ld_acquire(P.xflag + par * MAXM + lane + 32 * i)) : 8u;
-        if (XT_ON) {   // (trace: when the flags are in -- forces their completion here)
+        if (XT_ON && (XT_MASK & 1u)) {   // (trace, prologue group: when the flags are in -- forces their completion here)
             unsigned sx = 0u;
 #pragma unroll
             for (int i = 0; i < 16; ++i) sx += xv[i];
@@ -2112,6 +2393,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
         // CTAs' rings) + this CTA's own weight tile stages (A) + SFA.  Descriptors are unit-level (PAIR: unit = 2 tiles; tile = 2 u + crank)
         if (lane == 0) {
             int fills = 0, w = 0;
+            const int nrpre = (TPB2_RPRE && small) ? T.misc[30] : 0;   // (RPRE: ring stages already issued)
             unsigned long long pw1 = 0, pw2 = 0;   // (dbg) producer waits for free stages, FC1 / FC2
             bool in_fc2 = false;
             const uint32_t ring_peer = PR ? peer_addr(su32(ring), crank ^ 1u) : 0u, wf_peer = PR ? peer_addr(bar(B_WF), crank ^ 1u) : 0u;
@@ -2126,6 +2408,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 if (d.x >= 0) xt.rec(XT_BEG(10), xd0(d), xd1(d)); else xt.rec(XT_PT(13));
             };
             auto stage = [&](const CUtensorMap* map, int row, int ch0, const uint8_t* sfa, uint32_t atx) {   // KC chunks of one 128-row tile
+                if (TPB2_RPRE && fills < nrpre) { ++fills; return; }   // (RPRE: issued from the gate ids before the tables)
                 const int st = fills % NS;
                 const unsigned long long tw = DBGP ? ctime() : 0ull;
                 if (fills >= NS) { xt.rec(XT_BEG(11)); mbar_wait(bar(B_EMPTY + st), ((fills / NS) - 1) & 1); xt.rec(XT_END(11)); }
@@ -2133,7 +2416,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 // (PAIR: both CTAs' A bytes complete on the leader's FULL -- the leader expects 2 x; the peer's local FULL: its SFA (+ B / SFB))
                 mbar_expect_tx(bar(B_FULL + st), (PR ? (lead ? 2 * atx : 0u) : atx) + ((TPB2_PROBE & 8) ? 0 : KC * 512));
                 if (PR && !lead) tma3d_cg2(sb + OFF_A + st * A_BYTES, map, 0, row, ch0, full_lead + 8 * st);
-                else tma3d(sb + OFF_A + st * A_BYTES, map, 0, row, ch0, bar(B_FULL + st));
+                else tma3d(sb + OFF_A + st * A_BYTES, map, 0, row, ch0, bar(B_FULL + st), (TPB2_SHPOL && map == &P.map2s) ? SH_HINT : 0x12F0000000000000ull);
                 if (!(TPB2_PROBE & 8)) bulk_g2s(sb + OFF_SFA + st * KC * 512, sfa, KC * 512, bar(B_FULL + st));
                 ++fills;
             };
@@ -2144,7 +2427,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 if (shh >= 0) {   // (SHGU: stage c = chunks 2 c, 2 c + 1 of this CTA's gate or up rows + their scales)
                     mbar_expect_tx(bar(B_FULL + st), 2 * 16384 + 2 * 512);
                     for (int h2 = 0; h2 < 2; ++h2) {
-                        tma3d(sb + OFF_A + st * A_BYTES + h2 * 16384, &P.map1s, 0, shh * INTER + 128 * k, 2 * c + h2, bar(B_FULL + st));
+                        tma3d(sb + OFF_A + st * A_BYTES + h2 * 16384, &P.map1s, 0, shh * INTER + 128 * k, 2 * c + h2, bar(B_FULL + st), SH_HINT);
                         bulk_g2s(sb + OFF_SFA + st * KC * 512 + h2 * 512, P.sfa1s + (static_cast<size_t>(shh * (INTER / 128) + k) * NCH1 + 2 * c + h2) * 512, 512, bar(B_FULL + st));
                     }
                     ++fills;
@@ -2155,8 +2438,8 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                     tma3d_cg2(sb + OFF_A + st * A_BYTES, &P.map1s, 0, 128 * k, c, full_lead + 8 * st);
                     tma3d_cg2(sb + OFF_A + st * A_BYTES + 16384, &P.map1s, 0, INTER + 128 * k, c, full_lead + 8 * st);
                 } else {
-                    tma3d(sb + OFF_A + st * A_BYTES, &P.map1s, 0, 128 * k, c, bar(B_FULL + st));
-                    tma3d(sb + OFF_A + st * A_BYTES + 16384, &P.map1s, 0, INTER + 128 * k, c, bar(B_FULL + st));
+                    tma3d(sb + OFF_A + st * A_BYTES, &P.map1s, 0, 128 * k, c, bar(B_FULL + st), SH_HINT);
+                    tma3d(sb + OFF_A + st * A_BYTES + 16384, &P.map1s, 0, INTER + 128 * k, c, bar(B_FULL + st), SH_HINT);
                 }
                 bulk_g2s(sb + OFF_SFA + st * KC * 512, P.sfa1s + (static_cast<size_t>(k) * NCH1 + c) * 512, 512, bar(B_FULL + st));
                 bulk_g2s(sb + OFF_SFA + st * KC * 512 + 512, P.sfa1s + (static_cast<size_t>(INTER / 128 + k) * NCH1 + c) * 512, 512, bar(B_FULL + st));
@@ -2264,13 +2547,22 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 int RA = RT, RB = RT;
                 if (TPB2_FC2VAR && fc2g >= 4) { RB = max(0, RT - 2 * ((PG + 1) / 2)); RA = RB >= 2 * PG ? ((RB - 2 * PG) / fc2g) * fc2g : 0; }
                 else if (TPB2_FC2VAR && fc2g == 2 && fc2g0 >= 4) { RB = max(0, RT - 2 * ((PG + 1) / 2)); RA = RB; }   // (GMAX 2: pairs, then singles)
+                // (RTMAJ: R >= L0 late, row-pair-major over the late slots; units there are pairs / singles)
+                const int L0 = TPB2_RTMAJ ? (TPB2_RTMAJ >= 1000 ? (RA / NRT2U) * NRT2U : max(0, RT - TPB2_RTMAJ * NRT2U)) : RT;
+                if (TPB2_RTMAJ && L0 < RA) { RA = L0; if (fc2g == 1) RB = L0; }
                 const int nA = RA / fc2g, nB = (RB - RA) / 2;
+                auto rmap = [&](int R, int& row) -> int {   // R -> slot, row tile
+                    if (!TPB2_RTMAJ || R < L0) { row = R % NRT2U; return R / NRT2U; }
+                    const int Rp = R - L0, nl = Pall - L0 / NRT2U, rt = Rp / (2 * nl), q = Rp - rt * 2 * nl;
+                    row = 2 * rt + (q & 1);
+                    return L0 / NRT2U + (q >> 1);
+                };
                 auto tk = [&](int u, int& R0) -> int {
                     if (u < nA) { R0 = u * fc2g; return fc2g; }
                     if (u < nA + nB) { R0 = RA + 2 * (u - nA); return 2; }
                     R0 = RB + (u - nA - nB); return 1;
                 };
-                auto tslot = [&](int u) -> int { if (!TPB2_FC2VAR) return u / nrg; int R0; tk(u, R0); return R0 / NRT2U; };
+                auto tslot = [&](int u) -> int { if (!TPB2_FC2VAR) return u / nrg; int R0, row; tk(u, R0); return rmap(R0, row); };
                 const int units = TPB2_FC2VAR ? nA + nB + (RT - RB) : Pall * nrg;
                 // FC2 units in the order panels become ready: ticket u -> ready-list slot u / nrg (the panel whose h completed (u / nrg)-th), row
                 // group u % nrg.  One ticket ahead, its slot loaded as soon as the ticket arrives (acquire: the panel's h)
@@ -2283,6 +2575,9 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 int tq = (fc2l || TPB2_PROBE_END == 1) ? units : static_cast<int>(atomicAdd(P.fc2_next + par, 1u));
                 int tq2 = TPB2_FC2RLX ? static_cast<int>(atomicAdd(P.fc2_next + par, 1u)) : 0;   // (FC2RLX: the next ticket already in flight)
                 unsigned pf = tq < units ? ldf(rl + tslot(tq)) : 0u;
+                static_assert(!(TPB2_FC2CAP && TPB2_FC2RLX), "FC2CAP: one ticket at a time");
+                const int fcap = (units + PG - 1) / PG + TPB2_FC2CAP - 1;   // (FC2CAP: tickets this unit may claim)
+                int nclaim = 0;
                 for (;;) {
                     const int u = tq;
                     if (u >= units) break;
@@ -2300,14 +2595,14 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                     }
                     const int p = static_cast<int>(pf) - 1;
                     int4 d = make_int4(p < Ptot ? 2 : 4, p * nrg + rg, 0, 0);
-                    if (TPB2_FC2VAR) { int R0; const int cn = tk(u, R0); d.y = p * NRT2U + R0 % NRT2U; d.z = cn; }
+                    if (TPB2_FC2VAR) { int R0, row; const int cn = tk(u, R0); rmap(R0, row); d.y = p * NRT2U + row; d.z = cn; }
                     push(d);
                     if (TPB2_FC2RLX) {
                         const int tq3 = static_cast<int>(atomicAdd(P.fc2_next + par, 1u));   // (needed one iteration later)
                         pf = (tq2 < units && !f2s) ? ldf(rl + tslot(tq2)) : 0u;   // (in flight over issue(d))
                         tq = tq2; tq2 = tq3;
                     } else {
-                        tq = static_cast<int>(atomicAdd(P.fc2_next + par, 1u));
+                        tq = (TPB2_FC2CAP && ++nclaim >= fcap) ? units : static_cast<int>(atomicAdd(P.fc2_next + par, 1u));
                         pf = (tq < units && !f2s) ? ld_acquire(rl + tslot(tq)) : 0u;
                     }
                     issue(d);
@@ -2507,7 +2802,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                     }
                 }
                 q[T1Q + 2] = c;
-                fence_acq_rel();   // (the queued units' outp / shout rows: observed through the epilogue's barrier + queue entry)
+                if (!(TPB2_PROBE & 512)) fence_acq_rel();   // (the queued units' outp / shout rows: observed through the epilogue's barrier + queue entry)
 #pragma unroll
                 for (int i = 0; i < NRT; ++i) {
                     const unsigned r = T1CNT ? static_cast<unsigned>(((i < 8 ? clo : chi) >> (8 * (i & 7))) & 0xFFull) : rn[i];
@@ -2556,6 +2851,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
     } else if (warp == 6) {
         // ======================================================== B operand by bulk copies: FC1 x panel images / FC2 h panel images
         int fills = 0, w = 0, hub = 0;   // (hub: H1U FC2 units loaded)
+        int rfi = 0;   // (TPB2_SFBI) routed FC1 items seen: item buffer rfi & 1
         bool x_ready = false;
         // (PAIR: this CTA's token rows rb .. rb + nb - 1 of a panel padded to 16; the SFB images keep every token)
         constexpr int NPR = PR ? 16 : 8;
@@ -2614,16 +2910,36 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                     // SFB rows: generic 16-B loads two stages ahead, stored into the stage's SFB image before the stage's arrive (+ proxy fence)
                     const uint4* srow = reinterpret_cast<const uint4*>(P.xsf2 + static_cast<size_t>(tok) * NSTG1 * 16);
                     uint4 q0 = make_uint4(0u, 0u, 0u, 0u), q1 = q0;
-                    if (lane < npad) { q0 = __ldcg(srow + d.z); if (d.z + 1 < d.w) q1 = __ldcg(srow + d.z + 1); }
+                    constexpr int SB = TPB2_SFBI_SB;   // (SFBI) stages per SFB batch: one proxy fence per batch, the next batch's loads in flight
+                    uint4 qb[SB];
+                    const uint32_t ib = static_cast<uint32_t>(OFF_SFBI + (rfi & 1) * (NSTG1 * 512));
+                    if (TPB2_SFBI) {
+                        ++rfi;
+#pragma unroll
+                        for (int i = 0; i < SB; ++i) qb[i] = (lane < npad && d.z + i < d.w) ? __ldcg(srow + d.z + i) : make_uint4(0u, 0u, 0u, 0u);
+                    } else if (lane < npad) { q0 = __ldcg(srow + d.z); if (d.z + 1 < d.w) q1 = __ldcg(srow + d.z + 1); }
                     for (int s = d.z; s < d.w; ++s) {
+                        if (TPB2_SFBI && ((s - d.z) % SB) == 0) {   // batch s .. s + SB - 1 -> the item buffer, one fence; next batch's loads
+                            if (lane < npad) {
+#pragma unroll
+                                for (int i = 0; i < SB; ++i)
+                                    if (s + i < d.w) *reinterpret_cast<uint4*>(smem + ib + (s + i) * 512 + lane * 16) = qb[i];
+                                fence_proxy_async_smem();
+                            }
+#pragma unroll
+                            for (int i = 0; i < SB; ++i) qb[i] = (lane < npad && s + SB + i < d.w) ? __ldcg(srow + s + SB + i) : make_uint4(0u, 0u, 0u, 0u);
+                            __syncwarp();
+                        }
                         const int st = fills % NS;
                         if (fills >= NS) mbar_wait(bar(B_EMPTY + st), ((fills / NS) - 1) & 1);
+                        if (!TPB2_SFBI) {
                         const uint4 cur = q0;
                         q0 = q1;
                         if (lane < npad && s + 2 < d.w) q1 = __ldcg(srow + s + 2);
-                        if (lane < npad && !(TPB2_PROBE & 4)) {
+                        if (lane < npad && !(TPB2_PROBE & 4) && !(TPB2_PROBE & 128)) {   // (PROBE 128: no SFB store + proxy fence, gathers kept)
                             *reinterpret_cast<uint4*>(smem + OFF_SFB + st * 512 + lane * 16) = cur;
                             fence_proxy_async_smem();
+                        }
                         }
                         __syncwarp();
                         if (lane == 0) mbar_expect_tx(bar(B_FULL + st), (TPB2_PROBE & 4) ? 0 : KC * nb * 128);
@@ -2742,6 +3058,8 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
         const uint32_t bfull0 = bar(B_FULL), bempty0 = bar(B_EMPTY), tsf0 = tmem_u + TSF0, bfullp0 = bar(B_FULLP);
         const uint32_t fullp_lead = PR ? peer_addr(bar(B_FULLP), 0u) : 0u;   // (PAIR peer: the leader's FULLP barriers)
         int fills = 0, w = 0, kacc = 0;   // accumulators issued so far: buffer kacc % ACC, use kacc / ACC
+        int rfi = 0;   // (TPB2_SFBI) routed FC1 items seen: SFB item buffer rfi & 1
+        const uint64_t sfbidesc0 = desc_sf(sb + OFF_SFBI);
         int hum = 0;   // (H1U: FC2 units issued -- h buffer hum & 1)
         int ncp = 0;   // (PROBE 16: SF copies only while the ring's TMEM SF slots are first filled -- later MMAs reuse stale, finite scales)
         auto cpsf = [&](uint32_t taddr, uint64_t desc) { if (!(TPB2_PROBE & 16) || ncp < 6 * NS) tc_cp_sf(taddr, desc); ++ncp; };
@@ -2773,6 +3091,9 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 continue;
             }
             if (lane == 0) xt.rec(XT_PT(71));
+            const bool sfbi = TPB2_SFBI && d.x == 1;   // (this routed FC1 item's SFB rows: item buffer rfi & 1, stage d.z + j)
+            const uint64_t sfbi0 = sfbidesc0 + static_cast<uint64_t>((((rfi & 1) * NSTG1) + d.z) * (512 >> 4));
+            if (sfbi) ++rfi;
             const int n = panel_n(d);
             const uint32_t npad = warp_uniform(static_cast<uint32_t>(PR ? (n + 15) & ~15 : (n + 7) & ~7));
             const uint32_t nbr = PR ? npad / 2 : npad;   // (B rows in this CTA's smem)
@@ -2901,7 +3222,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                             if (elect_one()) {
 #pragma unroll
                                 for (int c = 0; c < KC; ++c) cpsf(tsf + 4 * c, sfadesc0 + static_cast<uint64_t>((st * KC + c) * (512 >> 4)));
-                                cpsf(tsf + TSF_B, sfbdesc0 + static_cast<uint64_t>(st * (512 >> 4)));
+                                cpsf(tsf + TSF_B, sfbi ? sfbi0 + static_cast<uint64_t>(j * (512 >> 4)) : sfbdesc0 + static_cast<uint64_t>(st * (512 >> 4)));
 #pragma unroll
                                 for (int c = 0; c < KC; ++c) {
                                     const uint64_t ac = ad0 + c * (16384 >> 4), bc = bd0 + c * bstep;
@@ -3168,7 +3489,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                             const unsigned ev = T.ent[eb + tb + i];
                             const int t = static_cast<int>(ev & 511u);
                             for (unsigned km = ev >> 9; km; km &= km - 1)
-                                P.outp[(static_cast<size_t>(t) * TOPK_MAX + (__ffs(km) - 1)) * OUTP_LD + r * 128 + orow] = hv;
+                                if (!(TPB2_PROBE & 1024)) P.outp[(static_cast<size_t>(t) * TOPK_MAX + (__ffs(km) - 1)) * OUTP_LD + r * 128 + orow] = hv;
                         }
                         if (pub) xt.rec(XT_END(47));
                         if (DBGP && pub && !isdry) DBGP[b * 32 + 19] += ctime() - te1;
@@ -3211,7 +3532,7 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                         while (km) {
                             const int k = __ffs(km) - 1;
                             km &= km - 1;
-                            st_v4_hint(P.outp + (static_cast<size_t>(t) * TOPK_MAX + k) * OUTP_LD + r * 128 + 8 * c, val);
+                            if (!(TPB2_PROBE & 1024)) st_v4_hint(P.outp + (static_cast<size_t>(t) * TOPK_MAX + k) * OUTP_LD + r * 128 + 8 * c, val);
                         }
                     }
                     named_bar(1 + g, 128);   // (stg reused by the next row tile)
@@ -3605,8 +3926,9 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                     named_bar(3, 256);
                     if (pub) { xt.rec(XT_END(45)); xt.rec(XT_BEG(46)); }
                     if (pub && TPB2_HPUB && TPB2_RTPUB && !TPB2_T1W) { hpub_enqueue(smem, Ptot + p, true); xt.rec(XT_END(46), static_cast<uint32_t>(Ptot + p), 2u); }
+                    else if (pub && TPB2_PUBRED && (f2s || fc2l)) { red_release_add(P.pan_cnt + par * MAXP + Ptot + p, 1u); xt.rec(XT_END(46), static_cast<uint32_t>(Ptot + p), 2u); }
                     else if (pub) {
-                        const bool lastit = atom_add_acq_rel(P.pan_cnt + par * MAXP + Ptot + p, 1u) == NT1S - 1u;
+                        const bool lastit = ((TPB2_PROBE & 256) ? atomicAdd(P.pan_cnt + par * MAXP + Ptot + p, 1u) : atom_add_acq_rel(P.pan_cnt + par * MAXP + Ptot + p, 1u)) == NT1S - 1u;
                         if (lastit) {   // the panel's last FC1 item: append it
                             unsigned* rl = P.rdy + par * (MAXP + 32);
                             st_release(rl + atomicAdd(rl + MAXP, 1u), static_cast<unsigned>(Ptot + p + 1));
@@ -3827,8 +4149,9 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
                 named_bar(3, 256);
                 if (pub) { xt.rec(XT_END(45)); xt.rec(XT_BEG(46)); }
                 if (pub && !isdry && TPB2_HPUB && TPB2_RTPUB && !TPB2_T1W) { hpub_enqueue(smem, p, false); xt.rec(XT_END(46), static_cast<uint32_t>(p), 0u); }
+                else if (pub && !isdry && TPB2_PUBRED && (f2s || fc2l)) { red_release_add(P.pan_cnt + par * MAXP + p, 1u); xt.rec(XT_END(46), static_cast<uint32_t>(p), 0u); }
                 else if (pub && !isdry) {
-                    const bool lastit = atom_add_acq_rel(P.pan_cnt + par * MAXP + p, 1u) == NT1 - 1u;
+                    const bool lastit = ((TPB2_PROBE & 256) ? atomicAdd(P.pan_cnt + par * MAXP + p, 1u) : atom_add_acq_rel(P.pan_cnt + par * MAXP + p, 1u)) == NT1 - 1u;
                     if (lastit) {   // the panel's last FC1 item: append it to the ready list
                         unsigned* rl = P.rdy + par * (MAXP + 32);
                         st_release(rl + atomicAdd(rl + MAXP, 1u), static_cast<unsigned>(p + 1));
@@ -3893,8 +4216,10 @@ __global__ void __launch_bounds__(THREADS, 1) tpb2_kernel(const __grid_constant_
     __syncthreads();
     if (DBGP && tid == 0) { DBGP[b * 32 + 7] = gtime(); DBGP[b * 32 + 31] = clock64(); }
     if (tid == 0) xt_anchor(TPB2_TRACE ? static_cast<void*>(P.dbg_) : nullptr, true);
-    if (tid == 0) {
-        fence_acq_rel();
+    if (tid == 0 && (TPB2_ARV & 32)) {   // (fire-and-forget: the next call reads the count after its griddepcontrol.wait)
+        asm volatile("red.relaxed.gpu.global.add.u64 [%0], 1;" ::"l"(reinterpret_cast<unsigned long long*>(P.work + 2)) : "memory");
+    } else if (tid == 0) {
+        if (!(TPB2_ARV & 4)) fence_acq_rel();   // (ARV 4: nothing in this kernel reads the counts; the next call is stream-ordered)
         if (atomicAdd(P.work + 1 + par, 1u) == static_cast<unsigned>(G) - 1u) atomicAdd(P.work, 1u);   // last CTA out: next epoch
     }
 }
@@ -3971,7 +4296,7 @@ void run(torch::Tensor maps, torch::Tensor w13_sf, torch::Tensor w2_sf, torch::T
     TORCH_CHECK((!TPB2_MMAX || M <= TPB2_MMAX) && M >= TPB2_MMIN, "this build: TPB2_MMIN <= M <= TPB2_MMAX");
     TORCH_CHECK(M >= 1 && M <= MAXM && xb.size(1) == DIM && xb.scalar_type() == torch::kBFloat16 && xb.is_contiguous());
     TORCH_CHECK(ids.size(0) == M && ids.size(1) <= 6 && ids.scalar_type() == torch::kInt32 && rw.scalar_type() == torch::kFloat32);
-    TORCH_CHECK(ndev == 1 || (ndev == NDEV && static_cast<int>(rs.size()) == NDEV && static_cast<int>(ag.size()) == NDEV));
+    TORCH_CHECK(ndev == 1 || (ndev == NDEV && (rs.size() == NDEV || rs.size() == NDEV + 1) && (ag.size() == NDEV || ag.size() == NDEV + 1)));
     Params P;
     std::memset(&P, 0, sizeof(P));
     std::memcpy(&P.map1, maps.data_ptr(), 256);
@@ -3994,6 +4319,10 @@ void run(torch::Tensor maps, torch::Tensor w13_sf, torch::Tensor w2_sf, torch::T
         P.rs[d] = ndev == 1 ? nullptr : reinterpret_cast<uint4*>(rs[d]);
         P.ag[d] = ndev == 1 ? nullptr : reinterpret_cast<uint4*>(ag[d]);
     }
+    P.rsmc = ndev > 1 && rs.size() > NDEV ? reinterpret_cast<uint4*>(rs[NDEV]) : nullptr;   // (rs / ag lists: NDEV peers [+ multicast])
+    P.agmc = ndev > 1 && ag.size() > NDEV ? reinterpret_cast<uint4*>(ag[NDEV]) : nullptr;
+    TORCH_CHECK(!(TPB2_MC & 5) || ndev == 1 || P.rsmc, "TPB2_MC 1 / 4: the rs list needs the multicast address (NDEV + 1 entries)");
+    TORCH_CHECK(!(TPB2_MC & 2) || ndev == 1 || P.agmc, "TPB2_MC 2: the ag list needs the multicast address (NDEV + 1 entries)");
     P.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
     P.M = M; P.my_rank = static_cast<int>(my_rank); P.ndev = static_cast<int>(ndev);
     P.oneshot = M <= TPB2_ONESHOT_MAXM ? 1 : 0;
@@ -4015,7 +4344,9 @@ void run(torch::Tensor maps, torch::Tensor w13_sf, torch::Tensor w2_sf, torch::T
     } else if (wptr.size() > 5 && wptr[5]) {   // in-kernel router: wptr[5] = router W bf16 [256][4096], wptr[6 ..] = (k0, kn) per K-part; glog = rpart
         const int S = P.nparts;
         TORCH_CHECK(S >= 1 && S <= 4 && static_cast<int>(wptr.size()) >= 6 + 2 * S && M >= 5 && M <= 128 && P.glog, "in-kernel router: 5 <= M <= 128");
-        P.rS = S; P.rR = (M + 7) & ~7; P.rpart = const_cast<float*>(P.glog);
+        P.rS = S; P.rR = (M + 7) & ~7; P.rpart = const_cast<float*>(P.glog); P.rB = 1;
+        if (TPB2_RRB && M > 64) { P.rB = (M + 63) / 64; P.rR = 64; }   // (64-row blocks: box height 64, OOB rows zero-filled)
+        TORCH_CHECK(16 * S * P.rB <= static_cast<int>(grid), "in-kernel router: units > grid");
         int rch = 0;
         for (int i = 0; i < S; ++i) {
             P.rk0[i] = static_cast<int>(wptr[6 + 2 * i]); P.rkn[i] = static_cast<int>(wptr[7 + 2 * i]);

@@ -33,7 +33,95 @@ ROLES = ['pro', 'prod', 'mma', 'b', 'epi', 'tail']
 KINDS = {1: 'routed FC1', 2: 'routed FC2', 3: 'shared FC1', 4: 'shared FC2'}
 
 
-def dump(buf, grid, meta, path, warps=WARPS, depth=DEPTH):
+SLAB_HDR = 4   # v2: uint64 words of a warp header {magic, smid, cta, warp, overflow, ..} (uint32)
+GROUPS = ['prologue', 'producer', 'mma', 'b', 'epilogue', 'tail']
+
+
+def group_of(sid):
+    """xtrace.cuh xt_group (K-stage roles)."""
+    if 10 <= sid <= 14: return 1
+    if 20 <= sid <= 24 or sid in (71, 72): return 2
+    if sid in (30, 31): return 3
+    if 40 <= sid <= 49 or 73 <= sid <= 75: return 4
+    if 50 <= sid <= 59: return 5
+    return 0
+
+
+def words(grid, fmt=1, warps=WARPS, depth=DEPTH):
+    """int64 words of the trace buffer for this format."""
+    return grid * HDR + grid * warps * (depth * 2 if fmt == 1 else SLAB_HDR + depth)
+
+
+def decode_v2(b, grid, warps=WARPS, depth=DEPTH):
+    """v2 (XTrace layout) -> per-CTA per-warp [(clock, site_full, a0)] + the raw-integrity report (XTrace validation checks)."""
+    import torch
+    hdr = b[:grid * HDR].view(grid, HDR)
+    slab = b[grid * HDR:].view(grid, warps, SLAB_HDR + depth)
+    h32 = slab[:, :, :SLAB_HDR].contiguous().view(torch.int32).view(grid, warps, 2 * SLAB_HDR).to(torch.int64) & 0xFFFFFFFF
+    r = slab[:, :, SLAB_HDR:]
+    clk = r & 0xFFFFFFFF
+    meta = (r >> 32) & 0xFFFFFFFF
+    live = meta != 0
+    n = live.sum(-1)
+    rep = dict(fmt=2, record_bytes=8, depth=depth, warps_with_records=int((n > 0).sum()), max_records=int(n.max()),
+               overflow_warps=int((h32[:, :, 4] != 0).sum()), uninitialized_warps_with_records=0, noncontiguous_warps=0,
+               smid_mismatch_warps=0, nonmonotone_warps=0, unpaired_end=0, unclosed_begin=0,
+               events_by_group={g: 0 for g in GROUPS})
+    hl, ml, cl, nl = h32.tolist(), meta.tolist(), clk.tolist(), n.tolist()
+    sm_cta = hdr[:, 4].tolist()
+    out = []
+    for c in range(grid):
+        wr = []
+        for w in range(warps):
+            k = nl[c][w]
+            if k == 0:
+                wr.append([]); continue
+            if hl[c][w][0] != 0x58543202: rep['uninitialized_warps_with_records'] += 1
+            if any(x != 0 for x in ml[c][w][k:]): rep['noncontiguous_warps'] += 1
+            if hl[c][w][1] != sm_cta[c] and sm_cta[c]: rep['smid_mismatch_warps'] += 1
+            recs, prev, mono, depth_ = [], None, True, {}
+            for i in range(k):
+                m, t = ml[c][w][i], cl[c][w][i]
+                sid, kind, pay = m & 0x7F, (m >> 7) & 3, m >> 9
+                if prev is not None and ((t - prev) & 0xFFFFFFFF) >= (1 << 31): mono = False
+                prev = t
+                if kind == 1: depth_[sid] = depth_.get(sid, 0) + 1
+                elif kind == 2:
+                    if depth_.get(sid, 0) == 0: rep['unpaired_end'] += 1
+                    else: depth_[sid] -= 1
+                rep['events_by_group'][GROUPS[group_of(sid)]] += 1
+                recs.append((t, sid | (kind << 12), (((pay >> 20) & 7) << 28) | (pay & 0xFFFFF)))
+            rep['unclosed_begin'] += sum(depth_.values())
+            if not mono: rep['nonmonotone_warps'] += 1
+            wr.append(recs)
+        out.append(wr)
+    rep['valid'] = (rep['overflow_warps'] == 0 and rep['noncontiguous_warps'] == 0 and rep['smid_mismatch_warps'] == 0
+                    and rep['nonmonotone_warps'] == 0 and rep['uninitialized_warps_with_records'] == 0)
+    return hdr.tolist(), out, rep
+
+
+def dump(buf, grid, meta, path, warps=WARPS, depth=DEPTH, fmt=1):
+    """buf: int64 cuda/cpu tensor of the xtrace buffer.  Writes {meta, ctas: [{cta, sm, t0, t1, recs: [[warp, t_ns, site, a0, a1]..]}]};
+    fmt 2 (XTrace layout) also stores meta['validation'] (raw-integrity report; an invalid trace must not be interpreted)."""
+    if fmt == 2:
+        b = buf.detach().cpu()
+        hdr, recs, rep = decode_v2(b, grid, warps, depth)
+        base = min(h[0] for h in hdr if h[0])
+        ctas = []
+        for c in range(grid):
+            g0, c0, g1, c1, sm = hdr[c][:5]
+            if not g0 or not g1:
+                continue
+            k = (g1 - g0) / max(1, (c1 - c0))   # ns per SM cycle of this CTA (same-SM intervals; cross-SM alignment is approximate)
+            rows = []
+            for w, wr in enumerate(recs[c]):
+                for t, site, a0 in wr:
+                    rows.append((w, round((g0 - base) + ((t - (c0 & 0xFFFFFFFF)) % (1 << 32)) * k, 1), site, a0, 0))
+            rows.sort(key=lambda r: (r[0], r[1]))
+            ctas.append(dict(cta=c, sm=sm, t0=g0 - base, t1=g1 - base, clk_ghz=round((c1 - c0) / max(1, g1 - g0), 4), recs=rows))
+        meta = dict(meta, validation=rep, clock_mapping='per-CTA anchors: intervals within a CTA are same-SM; cross-SM alignment approximate')
+        Path(path).write_text(json.dumps(dict(meta=meta, ctas=ctas), separators=(',', ':')))
+        return rep
     """buf: int64 cuda/cpu tensor of the xtrace buffer.  Writes {meta, ctas: [{cta, sm, t0, t1, recs: [[warp, t_ns, site, a0, a1]..]}]}"""
     import torch
     b = buf.detach().cpu()
@@ -171,6 +259,12 @@ def show(doc, file=sys.stdout):
     m = doc['meta']
     p = lambda *a: print(*a, file=file)
     p(f"xtrace: {m.get('kernel', '?')}  M {m.get('m')}  rank {m.get('rank')}  grid {len(doc['ctas'])}  (times us from the first CTA start)")
+    v = m.get('validation')
+    if v:
+        p(f"  validation (XTrace raw checks): {'VALID' if v['valid'] else 'REJECTED'}  warps {v['warps_with_records']}  max records "
+          f"{v['max_records']}/{v['depth']}  overflow {v['overflow_warps']}  noncontiguous {v['noncontiguous_warps']}  smid mismatch "
+          f"{v['smid_mismatch_warps']}  nonmonotone {v['nonmonotone_warps']}  unpaired end {v['unpaired_end']}  unclosed begin "
+          f"{v['unclosed_begin']}  events {v['events_by_group']}")
     r = R['residency']
     p(f"  residency: {r['ctas']} CTAs on {r['sms']} SMs, start spread {r['start_spread']:.2f}, end first/median/last {r['end_first']:.2f} / "
       f"{r['end_median']:.2f} / {r['end_last']:.2f}, duration spread {r['dur_spread']:.2f}x, SM clock {r['clk_ghz']:.3f} GHz")

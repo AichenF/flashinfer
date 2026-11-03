@@ -41,6 +41,8 @@ def worker(rank, args):
     group = dist.group.WORLD
     ar = dispatch_custom_allreduce(group, dev)(group, dev)
     assert not ar.disabled
+    ncg = dist.new_group(backend='nccl') if args.gpu_align else None   # (--gpu-align: GPU-side rank alignment right before each timed region)
+    tiny = torch.zeros(16, dtype=torch.float32, device=dev)
 
     def gather(obj):
         res = [None] * ndev
@@ -60,7 +62,7 @@ def worker(rank, args):
     if args.stamps:
         args.flags = (args.flags + ' -DTPB2_DBG=1').strip()
     if args.trace:
-        args.flags = (args.flags + ' -DTPB2_TRACE=1').strip()
+        args.flags = (args.flags + f' -DTPB2_TRACE={args.xt_fmt}' + (f' -DTPB2_XT_MASK={args.xt_mask}' if args.xt_fmt == 2 else '')).strip()
     tagf = lambda f: ('_' + f.replace('-D', '').replace('=', '').replace(' ', '_')) if f else ''
     KE = tpb2.load_ext(tag=tagf(args.flags), flags=tuple(args.flags.split()))
     lib = CudaRTLibrary()
@@ -69,6 +71,20 @@ def worker(rank, args):
     def make_state(E):   # workspace + IPC-linked all-reduce buffers of one kernel build
         st_ = tpb2.RankState(E, dev, ndev, rank)
         tables = []
+        if args.mcbuf and ndev > 1:   # symmetric-memory buffers (cuMem VMM, peer-mapped) + their NVLS multicast address as entry ndev
+            import torch.distributed._symmetric_memory as symm_mem
+            for nbytes in [tpb2.RankState.RS_BYTES(E), tpb2.RankState.AG_BYTES(E)]:
+                t = symm_mem.empty(nbytes, dtype=torch.uint8, device=dev)
+                t.zero_()
+                h = symm_mem.rendezvous(t, group.group_name)
+                keep.append((t, h))
+                off = t.data_ptr() - h.buffer_ptrs[rank]
+                assert h.multicast_ptr != 0, 'no multicast support for the symmetric buffers'
+                tables.append([h.buffer_ptrs[d] + off for d in range(ndev)] + [h.multicast_ptr + off])
+            torch.cuda.synchronize()
+            dist.barrier()
+            st_.link_ptrs(*tables)
+            return st_
         for nbytes in [tpb2.RankState.RS_BYTES(E), tpb2.RankState.AG_BYTES(E)]:
             ptr = lib.cudaMalloc(nbytes)
             lib.cudaMemset(ptr, 0, nbytes)
@@ -289,25 +305,30 @@ def worker(rank, args):
     if args.sweep:   # bitwise sweep: production layer vs ours (build 1, and build 2 if --flags2) over consecutive capture offsets
         big = C.capture_pool(args.cap, [args.sweep + max(args.ms)], dev)[args.sweep + max(args.ms)]
         for m in args.ms:
-            res = [0, 0, 0, 0, 0, 0]   # build 1: offsets with mismatches, elements; build 2: same; build 1 + in-kernel router (--arms SF): same
+            res = [0, 0, 0, 0, 0, 0, 0, 0]   # build 1: offsets with mismatches, elements; build 2: same; build 1 + in-kernel router (--arms SF): same; dispatched (D / DF)
             sf = bool(args.arms and 'SF' in args.arms and 5 <= m <= args.rfmax)
+            sd = bool(args.arms and ('D' in args.arms or 'DF' in args.arms))
             for off in range(args.sweep):
                 xs[m] = big[off:off + m].contiguous()
                 a = prods[0](xs[m]).clone()
                 s1 = ours_sh(0, m).clone()
                 s2 = ours_sh2(0, m).clone() if st2 is not None else None
                 s3 = ours_shf(0, m).clone() if sf else None
+                s4 = ours_disp(0, m, 'DF' in args.arms).clone() if sd else None
                 torch.cuda.synchronize()
                 n1 = int((s1 != a).sum()); res[0] += n1 > 0; res[1] += n1
                 if s2 is not None:
                     n2 = int((s2 != a).sum()); res[2] += n2 > 0; res[3] += n2
                 if s3 is not None:
                     n3 = int((s3 != a).sum()); res[4] += n3 > 0; res[5] += n3
+                if s4 is not None:
+                    n4 = int((s4 != a).sum()); res[6] += n4 > 0; res[7] += n4
             allr = gather(res)
             if rank == 0:
                 print(f'SWEEP M {m}: {args.sweep} offsets  build1 offsets with mismatches {[r_[0] for r_ in allr]} elements {[r_[1] for r_ in allr]}'
                       + (f'  build2 {[r_[2] for r_ in allr]} elements {[r_[3] for r_ in allr]}' if st2 is not None else '')
-                      + (f'  build1+SF {[r_[4] for r_ in allr]} elements {[r_[5] for r_ in allr]}' if sf else ''), flush=True)
+                      + (f'  build1+SF {[r_[4] for r_ in allr]} elements {[r_[5] for r_ in allr]}' if sf else '')
+                      + (f'  dispatched {[r_[6] for r_ in allr]} elements {[r_[7] for r_ in allr]}' if sd else ''), flush=True)
         if rank == 0:
             print('B2_LAYER_AB_COMPLETE', flush=True)
         return
@@ -390,13 +411,13 @@ def worker(rank, args):
                     print(f'   stamps M {m} rank {r_}: {l_}', flush=True)
         if args.trace:   # one cold-ish call (copy 1) with the Xtrace-style phase trace (xtrace.cuh), dumped per rank, shown for rank 0
             import xtrace
-            st.dbg = torch.zeros(st.grid * (xtrace.HDR + xtrace.WARPS * xtrace.DEPTH * 2), dtype=torch.int64, device=dev)
+            st.dbg = torch.zeros(xtrace.words(st.grid, args.xt_fmt), dtype=torch.int64, device=dev)
             for _ in range(2):
                 st.dbg.zero_()
                 (ours_shf if args.trace_arm == 'SF' else ours_sh_ker)(min(1, args.copies - 1), m)
             torch.cuda.synchronize()
             tp = args.out / f'xt_m{m}_r{rank}.json'
-            xtrace.dump(st.dbg, st.grid, dict(kernel='tpmoe_b2', m=m, rank=rank, label=args.flags), tp)
+            xtrace.dump(st.dbg, st.grid, dict(kernel='tpmoe_b2', m=m, rank=rank, label=args.flags, xt_mask=args.xt_mask), tp, fmt=args.xt_fmt)
             st.dbg = None
             dist.barrier()
             if rank == 0:
@@ -419,6 +440,9 @@ def worker(rank, args):
                   + (f'  D != A {[c.get("d_ne_a") for c in allchk]}' if args.arms and ('D' in args.arms or 'DF' in args.arms) else '')
                   + (f'  SD != S {[c.get("sd_ne_s") for c in allchk]} rel {[round(c.get("sd_vs_s", 0), 5) for c in allchk]}' if args.arms and 'SD' in args.arms else ''), flush=True)
             continue
+        if args.xt2_time and st2 is not None and st2.dbg is None:   # XTrace OFF/ON pairing: build 2 (TPB2_TRACE=2) records in every timed call
+            import xtrace
+            st2.dbg = torch.zeros(xtrace.words(st2.grid, 2), dtype=torch.int64, device=dev)
         if args.xt_overhead:   # probes live during the timing (overhead of the Xtrace-style instrumentation vs an unprobed build)
             import xtrace
             st.dbg = torch.zeros(st.grid * (xtrace.HDR + xtrace.WARPS * xtrace.DEPTH * 2), dtype=torch.int64, device=dev)
@@ -454,6 +478,8 @@ def worker(rank, args):
                     g.replay()
                 torch.cuda.synchronize()
                 dist.barrier()
+                if ncg is not None:
+                    dist.all_reduce(tiny, group=ncg)   # (the host barrier releases ranks ~0.1-1 ms apart: start the timed replays together on the GPUs)
                 s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 s.record()
                 for _ in range(10):
@@ -496,6 +522,9 @@ if __name__ == '__main__':
     ap.add_argument('--xoff', type=int, default=0, help='first capture-pool row of the M tokens (other inputs for the bitwise checks)')
     ap.add_argument('--sweep', type=int, default=0, help='bitwise sweep over this many consecutive capture offsets per M (no timing)')
     ap.add_argument('--flags3', default=None, help='a third kernel build (arms D / DF)')
+    ap.add_argument('--xt-fmt', dest='xt_fmt', type=int, default=1, help='--trace record layout: 1 legacy 16-B ring, 2 XTrace 8-B bounded slabs')
+    ap.add_argument('--xt-mask', dest='xt_mask', type=int, default=255, help='XTrace site groups (bits: 0 prologue 1 producer 2 mma 3 b 4 epilogue 5 tail)')
+    ap.add_argument('--xt2-time', dest='xt2_time', action='store_true', help='time build 2 (-DTPB2_TRACE=2 in --flags2) with its probes recording: OFF/ON pairs vs build 1')
     ap.add_argument('--rfmax', type=int, default=64, help='in-kernel router (arms SF / SF2 / DF) up to this M (M96/128 need -DTPB2_RRB=1)')
     ap.add_argument('--xbuilds', default=None, help='more builds (4, 5, ..) for --dispatch: "f,f+f,f+.." (+ between builds, , between flags)')
     ap.add_argument('--dispatch', default='', help='arms D / DF: "maxM:build,..." e.g. "8:3,24:1,512:2"')
@@ -506,6 +535,8 @@ if __name__ == '__main__':
     ap.add_argument('--ms', type=int, nargs='+', default=[1, 2, 4, 6, 8, 16, 20, 24, 32, 48, 64, 96, 128])
     ap.add_argument('--copies', type=int, default=4)
     ap.add_argument('--rounds', type=int, default=5)
+    ap.add_argument('--mcbuf', action='store_true', help='all-reduce buffers from torch symmetric memory + NVLS multicast address (TPB2_MC builds)')
+    ap.add_argument('--gpu-align', action='store_true', help='tiny NCCL all-reduce right before each timed region (GPU-side rank alignment)')
     ap.add_argument('--arms', nargs='*')
     ap.add_argument('--stamps', action='store_true', help='phase stamps of one fused-kernel call per M (per rank)')
     ap.add_argument('--rfuse', action='store_true', help='arm SR: our router kernel (b2_rfuse.cu) + the fused kernel')

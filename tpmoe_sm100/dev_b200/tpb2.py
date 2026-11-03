@@ -23,7 +23,11 @@ def load_ext(src='tpmoe_b2.cu', tag='', flags=()):
     os.environ['TORCH_CUDA_ARCH_LIST'] = '10.0a'
     build = OUT / f'build_tpb2{tag}'
     build.mkdir(exist_ok=True)
-    m = load(name=f'tpmoe_b2{tag}', sources=[str(OUT / src)], build_directory=str(build),
+    name = f'tpmoe_b2{tag}'
+    if len(name) > 190:   # (CPython builds the init symbol name from at most 200 characters of the module name)
+        import hashlib
+        name = 'tpmoe_b2_h' + hashlib.sha1(tag.encode()).hexdigest()[:24]
+    m = load(name=name, sources=[str(OUT / src)], build_directory=str(build),
              extra_cuda_cflags=['-O3', '-gencode=arch=compute_100a,code=sm_100a', '-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK', *flags],
              extra_ldflags=['-lcuda'], verbose=False)
     _EXT[key] = m
