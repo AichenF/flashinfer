@@ -1,0 +1,102 @@
+# PROVENANCE (sm90 snapshot, generated 2026-11-10 02:47 PST)
+
+Every file below is a byte copy of a git blob on computelab-sc-01 (/home/scratch.aichenf_wwfo/<repo>) at the pinned commit.
+
+Omitted on purpose: `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/tp4moe2_ns.cu` (the v28 base source pinned in that
+directory's sources.json). The h123 adapter does not build it, and it does not carry the TP2_B2B_FIX barrier; the fixed
+TP4 kernel of that lineage is ../serving_tp4moe2_h100/tp4moe2_ns.cu.
+
+| file | repo | commit | source path | sha256 (16) |
+|---|---|---|---|---|
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/README.md` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/README.md` | bebbb9837ebe4051 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/adapter.py` | efb1236ebd766700 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/make_src.sh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/make_src.sh` | 9edfbcc7175fb9c9 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/COMMIT` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/COMMIT` | 376478c35a36dae6 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/SHA256SUMS` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/SHA256SUMS` | 108f6240cdf90a9e |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/chain1.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/chain1.cuh` | cb33529948d33145 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/chain4.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/chain4.cuh` | 8e9f0e5584f93619 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/chain_ss.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/chain_ss.cuh` | 9e17d619b4a3398c |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/chain_ss1.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/chain_ss1.cuh` | 9b71290cd919f861 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/kpipe.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/kpipe.cuh` | f59adf8456b89b57 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/kpipe1.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/kpipe1.cuh` | 4e62762d21335c02 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/kpipe_w.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/kpipe_w.cuh` | 3e2f8f0d541817e0 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/kpipe_wa.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/kpipe_wa.cuh` | 016783f8c0be7a6f |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/shared_num.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/shared_num.cuh` | 5e1b95cfb89a37f2 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/tp8v41.cu` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/tp8v41.cu` | e4abc62f6c830d31 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/tp8v41.py` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/tp8v41.py` | f0efa83400e49ea7 |
+| `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/v41_prep.py` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp8/src/v41_prep.py` | 3c7631ff53b200c2 |
+| `h20_dsv41f_tp8/README_owner.md` | v41_h20 | d9f89d40903c | `cl/results_cell/h20/dsv41f_tp8/README.md` | 0cf7d5d0d84cb052 |
+| `h20_dsv41f_tp8/full_layer/fr3_41_table.md` | v41_h20 | d9f89d40903c | `cl/results_cell/h20/dsv41f_tp8/runs/fr3_41_table.md` | 7d8164b8bc0f26df |
+| `h20_dsv41f_tp8/full_layer/fr3_f8_table.md` | v41_h20 | d9f89d40903c | `cl/results_cell/h20/dsv41f_tp8/runs/fr3_f8_table.md` | 07b7bf05c85dff9f |
+| `h20_dsv41f_tp8/full_layer/fr3_f4_table.md` | v41_h20 | d9f89d40903c | `cl/results_cell/h20/dsv41f_tp8/runs/fr3_f4_table.md` | cdde479c8469d158 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/README.md` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/README.md` | 30403ee6934a2cd3 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/adapter.py` | e3174ed231b5481b |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/chain4.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/chain4.cuh` | 8e9f0e5584f93619 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/chain_ss.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/chain_ss.cuh` | 9e17d619b4a3398c |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/kpipe.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/kpipe.cuh` | f59adf8456b89b57 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/kpipe_w.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/kpipe_w.cuh` | 3e2f8f0d541817e0 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/shared_num.cuh` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/shared_num.cuh` | 5e1b95cfb89a37f2 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/sources.json` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/sources.json` | a638e3ad9b7fc677 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/tp4_ext.py` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/tp4_ext.py` | 20aa961a2badb776 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/tp4moe2_ns.v78h21.cu` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/tp4moe2_ns.v78h21.cu` | 24d077ba1cde3c18 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/tp4moe2_ns.v94h13.cu` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/tp4moe2_ns.v94h13.cu` | c4442de29936b52c |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/tp4moe2_ns.v94h21.cu` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/src/tp4moe2_ns.v94h21.cu` | ac016739861ace10 |
+| `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/tp4moe2.py` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp8/tp4moe2.py` | 904bacd9368a5135 |
+| `h20_dsv4f_tp8_h123/harness/sm90_tp4moe2.py` | tpmoe_suite | 753579cf27ba | `harness/sm90_tp4moe2.py` | a55090848b887445 |
+| `h20_tp4/kernels/_h20b/PROVENANCE.md` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/PROVENANCE.md` | fc142b7dcbe8de28 |
+| `h20_tp4/kernels/h20_dsv41f_tp4/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp4/adapter.py` | 505803a17f6c0949 |
+| `h20_tp4/kernels/h20_dsv41f_tp4/README.md` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv41f_tp4/README.md` | 6e246a193f08405b |
+| `h20_tp4/kernels/h20_dsv4f_tp4/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp4/adapter.py` | 395d324472b2b36d |
+| `h20_tp4/kernels/h20_dsv4f_tp4/README.md` | tpmoe_suite | 753579cf27ba | `kernels/h20_dsv4f_tp4/README.md` | d44c5d97bbe1cd6b |
+| `h20_tp4/harness/sm90_tp4moe2.py` | tpmoe_suite | 753579cf27ba | `harness/sm90_tp4moe2.py` | a55090848b887445 |
+| `h20_tp4/kernels/_h20b/src/tp4v41e.cu` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/tp4v41e.cu` | c583204c811c8ef1 |
+| `h20_tp4/kernels/_h20b/src/tp4moe2_v94ex.cu` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/tp4moe2_v94ex.cu` | 142c910a20527cd1 |
+| `h20_tp4/kernels/_h20b/src/chain1.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/chain1.cuh` | cb33529948d33145 |
+| `h20_tp4/kernels/_h20b/src/chain2.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/chain2.cuh` | e64eff6fb7e7df5d |
+| `h20_tp4/kernels/_h20b/src/chain4.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/chain4.cuh` | 8e9f0e5584f93619 |
+| `h20_tp4/kernels/_h20b/src/chain_ss.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/chain_ss.cuh` | 9e17d619b4a3398c |
+| `h20_tp4/kernels/_h20b/src/kpipe.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/kpipe.cuh` | f59adf8456b89b57 |
+| `h20_tp4/kernels/_h20b/src/kpipe2.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/kpipe2.cuh` | 1986ba16cf874226 |
+| `h20_tp4/kernels/_h20b/src/kpipe2h.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/kpipe2h.cuh` | 98060e1cff3993c7 |
+| `h20_tp4/kernels/_h20b/src/kpipe_d.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/kpipe_d.cuh` | c01381361f10dafc |
+| `h20_tp4/kernels/_h20b/src/kpipe_w.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/kpipe_w.cuh` | 3e2f8f0d541817e0 |
+| `h20_tp4/kernels/_h20b/src/kpipe_wa.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/kpipe_wa.cuh` | 016783f8c0be7a6f |
+| `h20_tp4/kernels/_h20b/src/shared_num.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/shared_num.cuh` | 5e1b95cfb89a37f2 |
+| `h20_tp4/kernels/_h20b/src/tp8v41.py` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/tp8v41.py` | 1f1f295a499add0c |
+| `h20_tp4/kernels/_h20b/src/v41_prep.py` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/v41_prep.py` | 0840b9b8d2880352 |
+| `h20_tp4/kernels/_h20b/src/tp4moe2_par.py` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/tp4moe2_par.py` | f14c3a3136f0fb54 |
+| `h20_tp4/kernels/_h20b/src/port_tp4v41.py` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/port_tp4v41.py` | 358161b058d22747 |
+| `h20_tp4/kernels/_h20b/src/port_t2.py` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/port_t2.py` | 7b74ac41bce74720 |
+| `h20_tp4/kernels/_h20b/src/FINAL_h123.txt` | tpmoe_suite | 753579cf27ba | `kernels/_h20b/src/FINAL_h123.txt` | 873624cb0c4da828 |
+| `h200_cells/kernels/_h200/PROVENANCE.md` | tpmoe_suite | 753579cf27ba | `kernels/_h200/PROVENANCE.md` | 30c68dbb4116bf6b |
+| `h200_cells/kernels/_h200/tphost.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/tphost.py` | 50f2eaffdc92e4e3 |
+| `h200_cells/kernels/_h200/v41_prep.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/v41_prep.py` | 4f7b22969d77b2b9 |
+| `h200_cells/kernels/_h200/port_v41_tp4.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/port_v41_tp4.py` | 6d06163a7e496cd7 |
+| `h200_cells/kernels/_h200/cells/h2cell.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/cells/h2cell.py` | 5db54851a47da951 |
+| `h200_cells/kernels/_h200/cells/h200_dsv41f_tp4/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/cells/h200_dsv41f_tp4/adapter.py` | 6a89929fca8c4153 |
+| `h200_cells/kernels/_h200/cells/h200_dsv41f_tp8/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/cells/h200_dsv41f_tp8/adapter.py` | 6e99fb9337193756 |
+| `h200_cells/kernels/_h200/cells/h200_dsv41f_tp8h/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/cells/h200_dsv41f_tp8h/adapter.py` | 43f89045244a0208 |
+| `h200_cells/kernels/_h200/cells/h200_dsv4f_tp4/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/cells/h200_dsv4f_tp4/adapter.py` | 79ea9a217be2eb79 |
+| `h200_cells/kernels/_h200/cells/h200_dsv4f_tp8/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/cells/h200_dsv4f_tp8/adapter.py` | f8908aadaac2f976 |
+| `h200_cells/kernels/_h200/cells/h200_dsv4f_tp8h/adapter.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/cells/h200_dsv4f_tp8h/adapter.py` | 89b8d4fb30674030 |
+| `h200_cells/kernels/_h200/src/tpv41.cu` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/tpv41.cu` | bd2e38e09148f8e5 |
+| `h200_cells/kernels/_h200/src/tpv41h.cu` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/tpv41h.cu` | f9604df0f2256385 |
+| `h200_cells/kernels/_h200/src/tp4moe2_v94ex.cu` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/tp4moe2_v94ex.cu` | 142c910a20527cd1 |
+| `h200_cells/kernels/_h200/src/tp4moe2_v78p12dev.cu` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/tp4moe2_v78p12dev.cu` | 24d077ba1cde3c18 |
+| `h200_cells/kernels/_h200/src/tp4moe2_v94p10dev.cu` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/tp4moe2_v94p10dev.cu` | c4442de29936b52c |
+| `h200_cells/kernels/_h200/src/tp4moe2_v94p11dev.cu` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/tp4moe2_v94p11dev.cu` | ac016739861ace10 |
+| `h200_cells/kernels/_h200/src/chain1.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/chain1.cuh` | cb33529948d33145 |
+| `h200_cells/kernels/_h200/src/chain4.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/chain4.cuh` | 8e9f0e5584f93619 |
+| `h200_cells/kernels/_h200/src/chain_ss.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/chain_ss.cuh` | 9e17d619b4a3398c |
+| `h200_cells/kernels/_h200/src/kpipe.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/kpipe.cuh` | f59adf8456b89b57 |
+| `h200_cells/kernels/_h200/src/kpipe1.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/kpipe1.cuh` | 4e62762d21335c02 |
+| `h200_cells/kernels/_h200/src/kpipe_w.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/kpipe_w.cuh` | 3e2f8f0d541817e0 |
+| `h200_cells/kernels/_h200/src/kpipe_wa.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/kpipe_wa.cuh` | 016783f8c0be7a6f |
+| `h200_cells/kernels/_h200/src/kpipet2.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/kpipet2.cuh` | 3cbbced2a390011d |
+| `h200_cells/kernels/_h200/src/shared_num.cuh` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/shared_num.cuh` | 5e1b95cfb89a37f2 |
+| `h200_cells/kernels/_h200/src/port_v41.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/port_v41.py` | e5fdb358e174b338 |
+| `h200_cells/kernels/_h200/src/rpl.py` | tpmoe_suite | 753579cf27ba | `kernels/_h200/src/rpl.py` | 644868a9e8848f10 |
+| `h200_cells/README_owner_results.md` | suite_h200 | 313f38802162 | `results/h200/README.md` | ff6c878d1a6cf4a2 |
+| `h200_cells/b2b_fix_README.md` | suite_h200 | 313f38802162 | `results/h200/b2b_fix/README.md` | dfa0732c816c48b0 |
+| `h200_cells/full_layer/README.md` | suite_h200 | 313f38802162 | `results/h200/full_layer/README.md` | e3461de5c5e9178d |
+| `h200_cells/full_layer/table_fr.md` | suite_h200 | 313f38802162 | `results/h200/full_layer/table_fr.md` | 6010bc6ab4015c1c |

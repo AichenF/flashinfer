@@ -1,0 +1,27 @@
+TP8 tpmoe kernel-level A/SV (tp_layer_ab, 8 x H20; .17 ratios run ~0.005-0.01 below .24), 2026-10-19 .. 10-22. FINAL (closed 10-26, goal
+1.40 not met; user decision: finalize h123).
+FINAL: h123 = 3-range M-dispatch hybrid, exact numerics (bitwise pattern unchanged vs the served path: 11111010100)
+  src/tp4moe2_ns.v78h21.cu  for M < 64 and M > 341   (= dev git serving_tpmoe_tp8 563e585 tp4moe2_v78p12dev.cu, sha256 62006dc57c2e..)
+  src/tp4moe2_ns.v94h13.cu  for 64..127              (= tp4moe2_v94p10dev.cu, a54e3bdc86f3..)
+  src/tp4moe2_ns.v94h21.cu  for 128..341             (= tp4moe2_v94p11dev.cu, 84fd8f911e61..)
+  tp_layer_ab.py --var-src "tp4moe2_ns.v78h21.cu,tp4moe2_ns.v94h13.cu@64-127,tp4moe2_ns.v94h21.cu@128-341"
+                 --a-first --var-pl 512 --var-lc --rpl-idx 48:1      (router: rpl split-K partials + LaunchCompletion edge for M > 16)
+  mean A/SV: .17 1.3111 / 1.3111 (layer_var102), 1.3120 / 1.3119 (var95); .24 1.3195 / 1.3186 (var96), 1.3154 / 1.3149 (var100).
+  h123 SV (.17 var102) M6..384: 42.7 61.6 65.2 69.7 83.1 93.1 111.4 126.2 149.5 169.9 213.4 us
+       A                         56.5 78.9 83.6 91.0 109.6 119.3 151.3 173.9 216.4 210.0 257.9 us
+Steps since h110 (each an 8-GPU A/B in one window, replicated):
+  h113 = exact router without cuBLAS splitKreduce (rpl: one batched cuBLASLt GEMM of split-K partials, summed in-kernel) + LC edge  ~+0.017 (clean A)
+  h119 = pre-wait scout behind the LC edge (dry route/tables walk warms the i-cache), M <= 48; --rpl-idx 48:1               +0.002 (var89/92)
+  h123 = early-CTA scout above M48 (6 CTAs resident during the router) + 3-range dispatch                                    +0.0035 (var95, both hosts)
+Refuted (exact): rq router at M <= 16 (h114), scout at all M (h115), arrival-rank routing (h120), v94h21 at M384 (h124), 14 early scouts at
+  M256 (h125), deferred row-tile publication (hwd, var100), sorted [row tile][entry] outp layout = 1 bulk copy per out tile (hsl, var102:
+  exact, bitwise, but -0.004: M6/16 +1 us, M64/192 -0.4..-0.85), in-kernel router (6 us fixed cost), rank-split router (est. <= +0.015).
+Refuted (non-exact prototypes, user-approved measurement only): own bf16 router (no faster than rpl, max ~+0.005); FC2 fp32 red.add of
+  weighted slot rows (var98: 1.09 -- red.global.add.v4.f32 ~1 TB/s L2-atomic bound, cp.reduce.async.bulk 1.5 TB/s, 2x bytes).
+Diagnostics: outp ceiling = FC2 slot stores (hos +0.013, var99/102): half TMA op count (hxo +0.007), half outp L2 footprint / HBM
+  write-back; completion wait (hwn) 0, freeo back-pressure (hwr) +0.004.  Router-free ceiling (KER_SV) ~1.40.
+Where the time goes (stamps_h123, 8-GPU eager, rank-max, us): M24 tables 9.2 fc1 34.8 fc2 16.1 t1 3.1 t2 2.8 t3 1.5 = 67.1;
+  M384 18.2 / 112.9 / 56.3 / 14.6 / 5.1 / 13.1 = 218.6.  Fused shared expert (sh - ns) +2.6..+16.6 us (~2x its FP8 ideal: 2 ring slots
+  per k-block, N32 panels; wider panels / dual accumulators hit the 96-register wall of 640 threads).  k-loop = dequant ALU-issue bound.
+Remaining structural levers need a kernel rewrite (fewer, fatter consumer warpgroups via setmaxnreg); est. +0.01..0.04, not pursued.
+Archive: maas_runs_v07/results/2026-10-26_tp8_layer_var77_102_h113_h123_final (read-only, MANIFEST.sha256).

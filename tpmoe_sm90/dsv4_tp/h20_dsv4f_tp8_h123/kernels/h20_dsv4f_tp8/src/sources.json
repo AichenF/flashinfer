@@ -1,0 +1,18 @@
+{
+ "variant": "tpmoe_v28",
+ "origin": "v27 (v24 sh + v27 ns) | v28: one source tp4moe2_ns.cu for both builds (ns: -DTP2_SHARED=0; sh: TP2_SHARED=1, N32-only shared pieces), parametrized by TP2_NDEV (4: ns SASS-identical to v27 ns; 8: TP8, INTER 256)",
+ "extension_sh": "tpmoe_v28sh_srv",
+ "extension_ns": "tpmoe_v28ns_srv",
+ "sha256": {
+  "tp4moe2_ns.cu": "8c134b70c556f6fbc09bb8dfc214b0f0f3b1d34761bb654304c2364d289df04b",
+  "chain4.cuh": "8e9f0e5584f9361936ad0a8dc32fd57d0c06967463b5c94f32a946324b378c55",
+  "kpipe.cuh": "f59adf8456b89b57f118ef09f85258df06512edb7cd76f5e0ff5edfb20d5a2f2",
+  "chain_ss.cuh": "9e17d619b4a3398cf6bdf927f1894aff781a2898b2af67cea5aee19fb47bc800",
+  "shared_num.cuh": "5e1b95cfb89a37f22e1de5cd9d491e393357566670df628b28d17753108bf7f9",
+  "tp4moe2.py": "904bacd9368a513599a8c8fbdf9c94c7d04e7a7c148d4df27d3b9c5e0960ec36",
+  "tp4_ext.py": "20aa961a2badb7764ba71824ba68376d702ac8055c10ba24721c6d8a093ab0bf",
+  "tp4_lazy.py": "1ae81b32015558987bfc798c95c7fbe086e2375ecd3d6314c5de9d8991bde125",
+  "install_tp4moe2.py": "4ce7262f4ce8e38ff19c7284f0a01585c3063bbce012551fbde49d56212c10d4",
+  "build.py": "f57087ade680ae733fc4479ecce7d8df62d7f6c3df41cab2f2fdc7f769d1c362"
+ }
+}
