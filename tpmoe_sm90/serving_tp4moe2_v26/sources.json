@@ -4,8 +4,8 @@
  "extension_sh": "tp4moe2_v24_srv",
  "extension_ns": "tp4moe2_v23ns_srv",
  "sha256": {
-  "tp4moe2_sh.cu": "94bd9217a168446d5d34e1a0359f95b9311b650a56f450155cb8a9f8c6f34dff",
-  "tp4moe2_ns.cu": "56c6488e01c3677c6bd87264822ad3d7a2cfcd2af203e997fa100983765d55cc",
+  "tp4moe2_sh.cu": "da9f2b779a18dd8c90e637ac89c67511ada1be9bba4ab01b1de0a861fef62efc",
+  "tp4moe2_ns.cu": "4928d8765cb2701a128f1472975927772d54aeb0e4ca072ebdc86652d85c5e44",
   "chain4.cuh": "8e9f0e5584f9361936ad0a8dc32fd57d0c06967463b5c94f32a946324b378c55",
   "kpipe.cuh": "f59adf8456b89b57f118ef09f85258df06512edb7cd76f5e0ff5edfb20d5a2f2",
   "chain_ss.cuh": "9e17d619b4a3398cf6bdf927f1894aff781a2898b2af67cea5aee19fb47bc800",

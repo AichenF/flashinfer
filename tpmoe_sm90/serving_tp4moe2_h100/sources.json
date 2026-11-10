@@ -4,7 +4,7 @@
  "extension_sh": "tpmoe_v94exsh_h100",
  "extension_ns": "tpmoe_v94exns_h100",
  "sha256": {
-  "tp4moe2_ns.cu": "bba973fbf88fb6d503f0c7aa51f1fe9a08138c11d911fb232a13fc51316eac02",
+  "tp4moe2_ns.cu": "142c910a20527cd127c0a818ec2494f989839c03436e5668af392fcb011f9aca",
   "chain4.cuh": "8e9f0e5584f9361936ad0a8dc32fd57d0c06967463b5c94f32a946324b378c55",
   "kpipe.cuh": "f59adf8456b89b57f118ef09f85258df06512edb7cd76f5e0ff5edfb20d5a2f2",
   "kpipe_w.cuh": "3e2f8f0d541817e0138e24d613166395980bcf6b79a463cc44e8973f7de24294",

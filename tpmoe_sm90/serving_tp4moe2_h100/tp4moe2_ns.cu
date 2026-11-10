@@ -3429,6 +3429,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp4moe2_kernel(const __grid_const
         STAMP(P, 24);
     }
     STAMP(P, 2);
+#ifndef TP2_B2B_FIX
+#define TP2_B2B_FIX 1
+#endif
+    if (TP2_B2B_FIX) named_bar_sync(1, NCONS);   // WAR fix: the last FC1 epilogue's act-tile reads (staging +16384..) finish before the
+                                                 // first two FC2 out tiles (no freeo wait) overwrite the shared staging area
 #if defined(TP2_STAMPS) && defined(TP2_TL_FC1)
     if (tid == 0) g_tl_fc1 = 0;
 #endif
