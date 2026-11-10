@@ -120,3 +120,24 @@ TP4 kernel of that lineage is ../serving_tp4moe2_h100/tp4moe2_ns.cu.
 - The hybrid adapters use ISPLIT 4.
 
 So every existing build is unchanged. The fix makes the reachable `tpv41h.cu` ISPLIT 2 DSV4.1 configuration correct.
+
+**Cross-rank LL message slots double-buffered by epoch parity (2026-11-11).** Hang fix; the outputs are unchanged.
+- **Symptom:** in the SM90 TP8 ports, the one-shot / RS / AG LL message slots had a single region, and readers waited for `tag == epoch`. A peer that has already finished call k can start call k+1 and overwrite its call-k message in a slower rank's slot before that rank reads it. The slower rank then spins forever.
+- **When it hangs:** reproduced on H20/H200 whenever one rank entered the kernel ≥ ~100 ms after the others, or when another process's kernel was running on the GPUs. cuda-gdb showed the stuck rank reading tag epoch+1 from one peer.
+- **Fix:** port the scheme the TP4 tp4moe2 lineage (v26 / v94ex) already uses:
+  - `TP2_LL_PARITY` (default 1);
+  - `RS_PAR` / `AG_PAR` halves selected by `(epoch & 1)` on every one-shot, RS and AG write and read;
+  - the extension's `RS_BYTES` / `AG_BYTES` exports now cover both halves, and a `LL_PARITY` attribute is exported.
+- **Verification:** -DTP2_LL_PARITY=0 gives SASS identical to the previous source. With the fix, rank outputs were bitwise identical at M8..512 on every cell, and all of these passed:
+  - b2b and mixed-M stress;
+  - an 8-call CUDA graph replayed 1500× per M;
+  - 100 ms rank skew;
+  - co-residency with a spinner.
+  Performance ratio is 0.997-1.003 against the pre-fix build.
+- **Files changed** (patched copies from suite_h200 port_parity.py):
+  - `h200_cells/kernels/_h200/src/{tpv41, tpv41h, tp4moe2_v78p12dev, tp4moe2_v94p10dev, tp4moe2_v94p11dev}.cu`
+  - `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/tp8v41.cu` (`SHA256SUMS` updated)
+  - `h20_dsv4f_tp8_h123/kernels/h20_dsv4f_tp8/src/tp4moe2_ns.{v78h21,v94h13,v94h21}.cu`, plus host `tp4moe2.py`, whose `RS_BYTES()`/`AG_BYTES()` now return the exports, and `src/sources.json`
+  - `h20_tp4/kernels/_h20b/src/tp4v41e.cu`, plus `h20_tp4/kernels/h20_dsv41f_tp4/adapter.py`, which now allocates the exported sizes and asserts `LL_PARITY == 1`
+- **Hosts already safe:** h200_cells `tphost.comm_bytes` and the tp8v41.py hosts already size from the exports.
+- **Unaffected:** the TP4 v94ex copies and the serving packages on sm90/tpmoe and sm90/tpmoe-h100 already had parity halves.

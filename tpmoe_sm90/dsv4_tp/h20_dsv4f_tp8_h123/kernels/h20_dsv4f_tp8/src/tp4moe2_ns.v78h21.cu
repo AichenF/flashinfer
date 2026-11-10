@@ -2838,6 +2838,15 @@ __device__ __forceinline__ size_t ag_idx(int rtile, int t, int m) { return ((siz
 constexpr int OS_MAXM = MAXM / NDEV;   // 128 | 64: NDEV x NRT x OS_MAXM one-shot rows fit the NDEV x LRT x MAXM RS rows
 static_assert(NDEV * NRT * OS_MAXM <= NDEV * LRT * MAXM, "one-shot messages fit the RS buffer");
 __device__ __forceinline__ size_t os_idx(int src, int rtile, int t, int m) { return ((size_t)((src * NRT + rtile) * OS_MAXM + t)) * NMSG + m; }
+// (port_parity, 11-10) rs / ag double-buffered by epoch parity (= v94ex fork d0a94547 / served v26; host RS_BYTES / AG_BYTES hold two
+// halves): a rank that pushed its call-k messages but has not read its peers' yet (late launch, preemption, time-slicing) is not
+// overrun by peers that finished call k and run call k+1 (the equality-tag waits would never match again); no rank gets two calls ahead
+#ifndef TP2_LL_PARITY
+#define TP2_LL_PARITY 1
+#endif
+constexpr size_t RS_REG = (size_t)NDEV * LRT * MAXM * NMSG;   // uint4: the RS / one-shot message region of one call
+constexpr size_t AG_REG = (size_t)NRT * MAXM * NMSG;
+constexpr size_t RS_PAR = TP2_LL_PARITY ? RS_REG : 0, AG_PAR = TP2_LL_PARITY ? AG_REG : 0;
 
 // T1 message m of (row tile, token t): slot-ordered fp32 sum x routing weight, x factor -> BF16, + shared -> BF16, then (ndev 1) the
 // output, (one-shot) a copy to every rank, (RS) the row tile's owner rank
@@ -2895,9 +2904,9 @@ __device__ __forceinline__ void t1_finish(const Params& P, int rtile, int t, int
         if (full6) o[2] = msg.z;
     } else if (P.oneshot) {
 #pragma unroll
-        for (int d = 0; d < NDEV; ++d) st_ll(P.rs[(P.my_rank + d) & (NDEV - 1)] + os_idx(P.my_rank, rtile, t, m), msg);   // own copy first
+        for (int d = 0; d < NDEV; ++d) st_ll(P.rs[(P.my_rank + d) & (NDEV - 1)] + (epoch & 1u) * RS_PAR + os_idx(P.my_rank, rtile, t, m), msg);   // own copy first
     } else {
-        st_ll(P.rs[(TP2_DBG_T1 & 1) ? P.my_rank : (rtile >> LOG2_LRT)] + rs_idx(P.my_rank, rtile & (LRT - 1), t, m), msg);
+        st_ll(P.rs[(TP2_DBG_T1 & 1) ? P.my_rank : (rtile >> LOG2_LRT)] + (epoch & 1u) * RS_PAR + rs_idx(P.my_rank, rtile & (LRT - 1), t, m), msg);
     }
 }
 __device__ __forceinline__ void t1_msg(const Params& P, const Tabs& T, int rtile, int t, int m, unsigned epoch) {
@@ -2960,9 +2969,9 @@ __device__ __forceinline__ void t1_pair_vec(const Params& P, const Tabs& T, int 
             if (full6) o[2] = msg.z;
         } else if (P.oneshot) {
 #pragma unroll
-            for (int d = 0; d < NDEV; ++d) st_ll(P.rs[(P.my_rank + d) & (NDEV - 1)] + os_idx(P.my_rank, rtile, t, m), msg);   // own copy first
+            for (int d = 0; d < NDEV; ++d) st_ll(P.rs[(P.my_rank + d) & (NDEV - 1)] + (epoch & 1u) * RS_PAR + os_idx(P.my_rank, rtile, t, m), msg);   // own copy first
         } else {
-            st_ll(P.rs[(TP2_DBG_T1 & 1) ? P.my_rank : (rtile >> LOG2_LRT)] + rs_idx(P.my_rank, rtile & (LRT - 1), t, m), msg);
+            st_ll(P.rs[(TP2_DBG_T1 & 1) ? P.my_rank : (rtile >> LOG2_LRT)] + (epoch & 1u) * RS_PAR + rs_idx(P.my_rank, rtile & (LRT - 1), t, m), msg);
         }
     }
     __syncwarp();   // the staging row is rewritten by the warp's next pair
@@ -3048,7 +3057,7 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
     (void)need;
     if (P.oneshot) {   // every (row tile, token) of this CTA: the NDEV ranks' messages, summed in rank order (fp32), one BF16 RN
         const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
-        const uint4* rs_me = P.rs[P.my_rank];
+        const uint4* rs_me = P.rs[P.my_rank] + (epoch & 1u) * RS_PAR;
         for (int x = tid; x < mine * NMSG; x += NCONS) {
             const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
             uint4 v[NDEV];
@@ -3075,7 +3084,7 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
     // T2: owner reduce in rank order (fp32 from rank 0's value, one BF16 RN), all-gather push
     {
         const int npair = LRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
-        const uint4* rs_me = P.rs[P.my_rank];
+        const uint4* rs_me = P.rs[P.my_rank] + (epoch & 1u) * RS_PAR;
         for (int x = tid; x < mine * NMSG; x += NCONS) {
             const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, lrt = j / M, t = j - lrt * M;
             uint4 v[NDEV];
@@ -3095,14 +3104,14 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
             const uint4 mo = make_uint4(pack_bf16x2_rn(a[0], a[1]), pack_bf16x2_rn(a[2], a[3]), pack_bf16x2_rn(a[4], a[5]), epoch);
             const int rtile = P.my_rank * LRT + lrt;
 #pragma unroll
-            for (int d = 0; d < NDEV; ++d) st_ll(P.ag[d] + ag_idx(rtile, t, m), mo);
+            for (int d = 0; d < NDEV; ++d) st_ll(P.ag[d] + (epoch & 1u) * AG_PAR + ag_idx(rtile, t, m), mo);
         }
     }
     STAMP(P, 5);
     // T3: pull the reduced rows
     {
         const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
-        const uint4* ag_me = P.ag[P.my_rank];
+        const uint4* ag_me = P.ag[P.my_rank] + (epoch & 1u) * AG_PAR;
         for (int x = tid; x < mine * NMSG; x += NCONS) {
             const int pi = x / NMSG, m = x - pi * NMSG, j = b + pi * G, rtile = j / M, t = j - rtile * M;
             uint4 v;
@@ -3939,6 +3948,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("NMAX") = TP2_NS::NMAX;
     m.attr("NRT") = TP2_NS::NRT;
     m.attr("NDEV") = TP2_NS::NDEV;
+    m.attr("LL_PARITY") = TP2_LL_PARITY;
+    m.attr("RS_BYTES") = (int64_t)(TP2_LL_PARITY ? 2 : 1) * TP2_NS::RS_REG * 16;
+    m.attr("AG_BYTES") = (int64_t)(TP2_LL_PARITY ? 2 : 1) * TP2_NS::AG_REG * 16;
     m.attr("INTER") = TP2_NS::INTER;
     m.attr("NQG") = TP2_NS::NQG;
     m.attr("NKT2") = TP2_NS::NKT2;

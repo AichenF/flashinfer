@@ -40,7 +40,8 @@ class Cell:
         self.E = TV.load_so(path)
         self.max_m = int(self.E.MAXM)
         self.st = TV.RankState(self.E, ctx.dev, alloc_comm=False)
-        self.st.link_ptrs(ctx.ipc_alloc(2 * self.st.rs_bytes), ctx.ipc_alloc(2 * self.st.ag_bytes))
+        assert int(getattr(self.E, 'LL_PARITY', 0)) == 1, 'tp4v41e built without TP2_LL_PARITY (LL slots must be epoch-parity double-buffered)'
+        self.st.link_ptrs(ctx.ipc_alloc(self.st.rs_bytes), ctx.ipc_alloc(self.st.ag_bytes))   # (exports hold both LL_PARITY halves)
         t0 = time.time()
         os.environ.setdefault('SGLANG_HUMMING_INPUT_QUANT_CONFIG', '{"dtype":"float8e4m3"}')
         import v41_prep

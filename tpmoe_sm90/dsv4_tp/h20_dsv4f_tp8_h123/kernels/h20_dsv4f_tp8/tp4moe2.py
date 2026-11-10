@@ -77,12 +77,12 @@ class RankState:
     @staticmethod
     def RS_BYTES():
         E = ext()
-        return E.NRT * E.MAXM * E.NMSG * 16   # [NDEV src][LRT lrt] = NRT slots of [MAXM][NMSG] uint4
+        return int(getattr(E, 'RS_BYTES', 0)) or E.NRT * E.MAXM * E.NMSG * 16   # (port_parity: the extension exports two LL_PARITY halves)
 
     @staticmethod
     def AG_BYTES():
         E = ext()
-        return E.NRT * E.MAXM * E.NMSG * 16
+        return int(getattr(E, 'AG_BYTES', 0)) or E.NRT * E.MAXM * E.NMSG * 16   # (port_parity: two LL_PARITY halves)
 
     def link_ptrs(self, rs_ptrs, ag_ptrs):
         self.rs_ptrs = [int(p) for p in rs_ptrs]
