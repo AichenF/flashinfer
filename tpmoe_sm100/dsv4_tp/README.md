@@ -1,0 +1,103 @@
+# tpmoe_sm100/dsv4_tp: TP MoE kernels for DeepSeek-V4-Flash and V4.1-Flash on B200 / B300
+
+This directory holds the routed-expert TP MoE kernels for decode on Blackwell. They are the final builds of the
+11-10 benchmark matrix (DSV4-Flash and DSV4.1-Flash × B200 / B300 × TP4 / TP8). Each kernel does the following
+in one launch:
+
+- in-kernel MXFP8 quantization of x;
+- FC1, SwiGLU (clamp 10) and FC2 over the routed experts, with MXFP4 weights (E8M0 per 32);
+- the weighted top-k combine;
+- the TP all-reduce over NVLink peer memory.
+
+Inputs are the routing ids and weights. The output is the reduced bf16 [M, H] on every rank. It is bitwise identical on
+all ranks and deterministic.
+
+Shapes:
+- DSV4-Flash: H 4096, I 2048, 256 experts, top-6.
+- DSV4.1-Flash: H 5120, I 2304, 384 experts, top-6. Per-rank slices are 576 (TP4) and 288 (TP8).
+
+The directory is a **release snapshot**. Every file is a byte copy of a git blob from the development repositories at a
+pinned commit; `PROVENANCE.md` lists the source repository, commit and SHA-256 of each file. Sub-directories keep the
+layout of their source repository, so relative imports and paths work unchanged. The directory is not wired into the
+FlashInfer build or Python API. Kernels JIT-build through `torch.utils.cpp_extension` (`sm_100a` for B200, `sm_103a` for
+B300) on first use.
+
+## Cells
+
+The ratio rows are best baseline ÷ ours (> 1 means ours is faster) for M = 8 / 16 / 32 / 64 / 128 / 256 / 384 / 512.
+
+| cell | directory | kernel | best baseline ÷ ours |
+|---|---|---|---|
+| B300 DSV4.1 TP8 | `dsv41_tp8/` | tp8v41: H2 (FC2 sharded on H) from M128, T1PAR, NMAX 32 + GATHER 0 from M256, LLS all-reduce | 1.22 1.20 1.11 1.06 1.03 0.99 0.99 1.03 |
+| B200 DSV4.1 TP8 | `b200_cells/tp8v41h2/` | the same kernel at the 3668057 defaults, plus a one-line LLS grid trap (`tp8v41g.cu`) | 1.26 1.20 1.10 1.05 1.02 0.99 0.99 1.03 |
+| B300 DSV4.1 TP4 | `b300_cells/cells/b300_dsv41f_tp4/` | v41tp4t (TP4 port of tp8v41, F2T K64 tails) + LLS | 1.24 1.18 1.08 1.03 0.98 0.93 0.97 1.02 |
+| B200 DSV4.1 TP4 | `b200_cells/v41tp4/` | v41tp4 + LLS | 1.24 1.19 1.08 1.02 0.97 0.92 0.96 1.01 |
+| B300 DSV4-Flash TP8 | `b300_cells/cells/b300_dsv4f_tp8/` | v4ft (DSV4-Flash port of the tp8v41 lineage) + LLS | 1.11 1.13 1.16 1.07 0.99 0.94 0.95 0.86 |
+| B300 DSV4-Flash TP4 | `b300_cells/cells/b300_dsv4f_tp4/` | v4ft + LLS | 1.21 1.19 1.10 1.04 0.96 0.94 0.99 0.90 |
+| B200 DSV4-Flash TP8 | `b200_cells/` (`arm_disp.py`) | v77 at NDEV 8 below M384, v4fti from M384 | 1.23 1.20 1.17 1.08 0.99 0.95 0.95 0.85 (owner run f8trV) |
+| B200 DSV4-Flash TP4 | `b200_cells/` (`arm_disp.py`) | v77 below M384, v4fti from M384 | 1.24 1.21 1.12 1.05 0.98 0.99 1.02 0.92 (owner run f4trV) |
+
+How the numbers were measured:
+- Protocol: one call per CUDA graph replay, with a 512 MiB L2 flush and an NCCL gate all-reduce plus a ~100 µs sleep
+  before every replay. The statistic is the per-rank median, then the max over ranks.
+- Routing: real plain-decode routing traces, 6 cases per M (layers 10/20/30 × decode steps 32/96).
+- Statistics: the median over 3 process-isolated repetitions.
+- Baselines: gc-moe (EP), DeepGEMM MegaMoE (EP), FlashInfer MegaMoE (EP) and trtllm-gen MXFP4 TP. The trtllm-gen arm has
+  the DSV4.1 intermediate zero-padded to 384 / 640.
+- Source: the suite matrix at tpmoe_suite 753579c. The two B200 DSV4-Flash rows are the B200 owner's suite-harness runs
+  with the v77 / v4ft dispatch; the suite matrix row for those two cells is v77 at every M (1.19 … 0.81 and 1.24 … 0.84).
+
+Blackwell crosses over near M128:
+- FC1 streams at about 5.3-5.6 TB/s of a ~7.1 TB/s ceiling. Unpacked FP4 doubles the smem footprint, which caps the
+  bytes in flight.
+- FC2 has short K per rank tile (288 at DSV4.1 TP8), so it is issue- and epilogue-bound.
+- The tail (T1 + all-reduce) is about 20% of the call at M512.
+
+## Pins
+
+- `dsv41_tp8/`: tp8_v41_b300 @ **e066ec9**. This is the last commit with the full correctness gate (o82):
+  - single-M back-to-back: 0 bad of 96,000 calls per M, M8..512;
+  - mixed-M bursts: 0 bad of 672,000.
+  - Defaults are those of 3668057, the build timed in the matrix. The commits after 3668057 add only default-off knobs.
+  - `README_owner_09e327e.md` is the owner's release README, written at a later commit. That commit adds 8bbb174
+    (F2HParams: B300 timing neutral, 168 checks bitwise, no back-to-back gate) and an ungated F2H_HSL knob. Neither is in
+    this snapshot.
+- `b300_cells/`: suite_b300b @ 5aee41f. These are the timed B300 DSV4-Flash TP4/TP8 and DSV4.1 TP4 cells; each cell
+  directory is self-contained.
+- `b200_cells/`: suite_b200 @ 278973e, the B200 release commit.
+  - `tp8v41h2/tp8v41g.cu` is tp8_v41_b300 @ 3668057 plus `if (TPB2_GRID && gridDim.x != TPB2_GRID) __trap();` in the LLS
+    all-reduce.
+  - `v4ft/v4fti.cu` is suite_b300b's `port_v4f.py` applied to tp8_v41_b300 @ e066ec9.
+  - `v77/tpmoe_b2.cu` is the routed-only v77, regenerated by `gen_v77.sh` from the v77 source on the sm100/tpmoe-b200
+    branch.
+
+## Build, run, gate
+
+Each sub-directory documents its own commands:
+- `dsv41_tp8/README_owner_09e327e.md`: `gen.sh`, `v41tp8.py`, and the gate command.
+- `b300_cells/cells/*/README.md`.
+- `b200_cells/results/b200/COMMON.md`: `sb.py`, `final_cells.sh`, `stress_v77.py`, and the gate.
+
+The headline harness is tpmoe_suite (`harness/bench.py`). Its adapters are `dsv41_tp8/suite_cell/adapter.py`,
+`b300_cells/cells/*/adapter.py` and `b200_cells/kernels/*/adapter.py`.
+
+Every kept build passed this correctness gate at every M:
+- ranks bitwise identical, deterministic, rel against an exact-numerics torch reference;
+- back-to-back bursts without sync between calls: rank skew, input cycling, distinct output tensors, CUDA-graph bursts;
+- mixed-M bursts over builds that share one workspace;
+- a high-count stress (≥ 1,500 rounds × 8 calls, eager and graph).
+
+## Known constraints
+
+- **F2H × ACTX** is forbidden by static_assert: the ACTX FC1 path does not stage h for the H2 sender.
+- **H2 workspace invariants:**
+  - The gathered-h buffer starts zero-filled.
+  - Per-CTA epochs are shared by every build on a workspace, so grids must be equal across ranks and every CTA runs every
+    call.
+- **LLS workspace invariants:**
+  - The LL region is 0xFF-filled once per workspace.
+  - LLS and non-LLS builds must not share a workspace.
+  - gridDim must equal TPB2_GRID; the B200 copies trap otherwise.
+- **H2 is off for DSV4-Flash.** It is 4-20 µs slower there.
+- **B200 regression:** non-H2 B200 builds of the tp8v41 lineage are 1.7-3.9 µs slower at M32-128 since the F2H prototype
+  commits. The cause is not found; it is not the Params layout.
