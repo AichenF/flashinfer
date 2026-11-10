@@ -4105,7 +4105,7 @@ static int set_weights(Params& P, torch::Tensor w1, torch::Tensor s1, torch::Ten
                 encode_map(&maps[7], s1t4.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, d_s, s_s, b_s);
             }
         } else {
-            const cuuint64_t d_w2[3] = {256, DIM / 64, (cuuint64_t)n * (INTER / 32)}, s_w2[2] = {HLB, 65536};
+            const cuuint64_t d_w2[3] = {256, DIM / 64, (cuuint64_t)n * (INTER / 32)}, s_w2[2] = {HLB, (cuuint64_t)DIM * 16};   // (k32 slice stride DIM * 16 B: 65536 for DIM 4096; v41 ISPLIT 2 = the first MODEL-1 non-tail build)
             const cuuint32_t b_w2[3] = {256, 4, 4};
             const cuuint64_t d_s2[3] = {256, DIM / 256, (cuuint64_t)n * (INTER / 32)}, s_s2[2] = {256, DIM};
             const cuuint32_t b_s2[3] = {256, 1, 4};

@@ -100,3 +100,23 @@ TP4 kernel of that lineage is ../serving_tp4moe2_h100/tp4moe2_ns.cu.
 | `h200_cells/b2b_fix_README.md` | suite_h200 | 313f38802162 | `results/h200/b2b_fix/README.md` | dfa0732c816c48b0 |
 | `h200_cells/full_layer/README.md` | suite_h200 | 313f38802162 | `results/h200/full_layer/README.md` | e3461de5c5e9178d |
 | `h200_cells/full_layer/table_fr.md` | suite_h200 | 313f38802162 | `results/h200/full_layer/table_fr.md` | 6010bc6ab4015c1c |
+
+## Post-snapshot changes
+
+**FC2 weight-map stride (2026-11-10).** The table above records the copies as imported, before this fix. Each of the four files below differs from its source in one line:
+
+- `h200_cells/kernels/_h200/src/tpv41.cu`
+- `h200_cells/kernels/_h200/src/tpv41h.cu`
+- `h20_dsv41f_tp8/kernels/h20_dsv41f_tp8/src/tp8v41.cu` (`SHA256SUMS` updated)
+- `h20_tp4/kernels/_h20b/src/tp4v41e.cu`
+
+**The change.** In the non-tail FC2 weight map, `s_w2[2] = {HLB, 65536}` becomes `{HLB, (cuuint64_t)DIM * 16}`. This is the same change as the H200 owner's fix in suite_h200.
+
+**Why.** The k32 slice stride was hard-coded for DIM 4096. With DIM 5120 (DSV4.1), the non-tail branch reads the wrong FC2 weights. The H200 owner measured rel 1.41 on `tpv41h.cu -DTP2_MODEL=1 -DTP2_ISPLIT=2`.
+
+**Who is affected.** No shipped or snapshotted configuration reaches that branch with DIM ≠ 4096:
+- The v41 TP4/TP8 builds have INTER_R 576 or 288, so they always take the tail branch, which already used DIM × 16.
+- The DSV4-Flash builds have 65536 == DIM × 16.
+- The hybrid adapters use ISPLIT 4.
+
+So every existing build is unchanged. The fix makes the reachable `tpv41h.cu` ISPLIT 2 DSV4.1 configuration correct.
