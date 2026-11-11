@@ -9,7 +9,7 @@ import torch
 from torch.utils.cpp_extension import load
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TP4_DIR = os.path.join(os.path.dirname(HERE), 'serving_tp4moe2_v26')   # kpipe.cuh / chain4.cuh: the k-loop pipeline headers shared with tp4moe2
+TP4_DIR = os.path.join(os.path.dirname(HERE), 'serving_tp4moe2_v26')   # kpipe.cuh: the k-loop pipeline header shared with tp4moe2
 _ext = None
 
 
